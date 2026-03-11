@@ -27,8 +27,9 @@
         description = "Mosquitto ACL rules (e.g. 'readwrite sensors/#', 'read status/#').";
       };
       passwordFile = lib.mkOption {
-        type = lib.types.path;
-        description = "Path to file containing the plain-text MQTT password.";
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "Path to file containing the plain-text MQTT password. null if set elsewhere or not needed.";
       };
     };
   };
@@ -100,9 +101,12 @@ in {
         {
           inherit (brokerCfg) address port;
           users =
-            lib.mapAttrs (_name: userCfg: {
-              inherit (userCfg) acl passwordFile;
-            })
+            lib.mapAttrs (_name: userCfg:
+              {inherit (userCfg) acl;}
+              // lib.optionalAttrs (userCfg.passwordFile != null) {
+                inherit (userCfg) passwordFile;
+              }
+            )
             cfg.users;
         }
       ];
