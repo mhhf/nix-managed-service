@@ -285,7 +285,7 @@ in {
     '';
   };
 
-  config = lib.mkIf (enabledServices != {}) (lib.mkMerge (
+  config = lib.mkMerge (
     # Per-service config generation
     (lib.mapAttrsToList (
         name: svc:
@@ -382,5 +382,5 @@ in {
         })
         mqttAcls;
     }
-  ));
+  );
 }
