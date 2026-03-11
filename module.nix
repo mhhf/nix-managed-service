@@ -244,36 +244,6 @@
       };
     };
   });
-
-  # Collect all enabled managed services
-  enabledServices = lib.filterAttrs (_: svc: svc.enable) config.managedServices;
-
-  # Whether nix-auto-proxy is available (proxy.services option exists)
-  hasProxy = options ? proxy && options.proxy ? services;
-
-  # Whether a service needs auto-generated ExecStart (no script, no explicit ExecStart)
-  needsExecStart = svc:
-    svc.service != null
-    && (svc.service.script or null) == null
-    && (svc.service.serviceConfig.ExecStart or null) == null;
-
-  # Collect MQTT ACL entries grouped by user
-  mqttAcls = let
-    servicesWithMqtt = lib.filterAttrs (_: svc: svc.mqtt != null) enabledServices;
-    entries = lib.mapAttrsToList (_: svc: {
-      inherit (svc.mqtt) user acl;
-    }) servicesWithMqtt;
-  in
-    lib.foldl' (
-      acc: entry:
-        acc
-        // {
-          ${entry.user} =
-            (acc.${entry.user} or [])
-            ++ entry.acl;
-        }
-    ) {}
-    entries;
 in {
   options.managedServices = lib.mkOption {
     type = lib.types.attrsOf managedServiceModule;
@@ -285,102 +255,120 @@ in {
     '';
   };
 
-  config = lib.mkMerge (
-    # Per-service config generation
-    (lib.mapAttrsToList (
-        name: svc:
-          lib.mkMerge [
-            # ── Proxy registration (only if nix-auto-proxy is available) ──
-            (lib.mkIf (svc.domain != null && hasProxy) {
-              proxy.services.${name} =
-                {
-                  enable = true;
-                  inherit (svc) domain;
-                }
-                // lib.optionalAttrs (svc.port != null) {inherit (svc) port;}
-                // lib.optionalAttrs (svc.target != null) {inherit (svc) target;}
-                // lib.optionalAttrs (svc.locations != null) {inherit (svc) locations;}
-                // lib.optionalAttrs (svc.description != null) {inherit (svc) description;}
-                // lib.optionalAttrs svc.publicAccess {inherit (svc) publicAccess;};
-            })
+  # Config uses a fixed-structure attrset so the module system can extract
+  # definitions from static keys without forcing config.managedServices.
+  # Values are lazy thunks — only evaluated when specific options are accessed,
+  # at which point managedServices is already resolvable (no cycle).
+  config = let
+    cfg = config.managedServices;
+    enabled = lib.filterAttrs (_: svc: svc.enable) cfg;
 
-            # ── Users and groups ─────────────────────────────────
-            (lib.mkIf (svc.user != null) {
-              users.users.${svc.user} = {
-                isSystemUser = true;
-                group = svc.group;
-                home = lib.mkIf (svc.stateDir != null) svc.stateDir;
-                createHome = lib.mkIf (svc.stateDir != null) true;
+    hasProxy = options ? proxy && options.proxy ? services;
+    hasMqtt = options ? mqtt && options.mqtt ? users;
+
+    needsExecStart = svc:
+      svc.service != null
+      && (svc.service.script or null) == null
+      && (svc.service.serviceConfig.ExecStart or null) == null;
+  in {
+    # ── Proxy registration (only if nix-auto-proxy is available) ──
+    proxy.services = lib.mkIf hasProxy (
+      lib.mapAttrs (_name: svc:
+        lib.mkIf (svc.domain != null) (
+          {
+            enable = true;
+            inherit (svc) domain;
+          }
+          // lib.optionalAttrs (svc.port != null) {inherit (svc) port;}
+          // lib.optionalAttrs (svc.target != null) {inherit (svc) target;}
+          // lib.optionalAttrs (svc.locations != null) {inherit (svc) locations;}
+          // lib.optionalAttrs (svc.description != null) {inherit (svc) description;}
+          // lib.optionalAttrs svc.publicAccess {inherit (svc) publicAccess;}
+        ))
+        enabled
+    );
+
+    # ── Users and groups ──────────────────────────────────────────
+    users.users = lib.mkMerge (lib.mapAttrsToList (_: svc:
+      lib.mkIf (svc.user != null) {
+        ${svc.user} = {
+          isSystemUser = true;
+          group = svc.group;
+          home = lib.mkIf (svc.stateDir != null) svc.stateDir;
+          createHome = lib.mkIf (svc.stateDir != null) true;
+        };
+      })
+      enabled);
+
+    users.groups = lib.mkMerge (lib.mapAttrsToList (_: svc:
+      lib.mkIf (svc.user != null) {
+        ${svc.group} = {};
+      })
+      enabled);
+
+    # ── State directories ─────────────────────────────────────────
+    systemd.tmpfiles.rules = lib.concatLists (lib.mapAttrsToList (_: svc:
+      lib.optional (svc.stateDir != null && svc.user != null)
+      "d ${svc.stateDir} 0750 ${svc.user} ${svc.group} -")
+      enabled);
+
+    # ── Firewall ──────────────────────────────────────────────────
+    networking.firewall.allowedTCPPorts =
+      lib.concatLists (lib.mapAttrsToList (_: svc: svc.openPorts) enabled);
+
+    networking.firewall.allowedUDPPorts =
+      lib.concatLists (lib.mapAttrsToList (_: svc: svc.openUDPPorts) enabled);
+
+    # ── Deployment assertions ─────────────────────────────────────
+    assertions = lib.concatLists (lib.mapAttrsToList (name: svc:
+      lib.optional (needsExecStart svc) {
+        assertion = svc.binaryPath != null;
+        message = "managedServices.${name}: either deployment.slotPath or deployment.package must be set (needed for auto-generated ExecStart)";
+      })
+      enabled);
+
+    # ── Systemd services ──────────────────────────────────────────
+    systemd.services = lib.mkMerge (lib.mapAttrsToList (name: svc:
+      lib.mkIf (svc.service != null) {
+        ${svc.serviceName} = lib.mkMerge [
+          # Framework defaults
+          {
+            wantedBy = ["multi-user.target"];
+            after = ["network.target"];
+            serviceConfig =
+              {
+                Type = "simple";
+                Restart = "always";
+                RestartSec = 10;
+              }
+              // svc.hardeningConfig
+              // lib.optionalAttrs (svc.user != null) {
+                User = svc.user;
+                Group = svc.group;
+              }
+              // lib.optionalAttrs (needsExecStart svc && svc.binaryPath != null) {
+                ExecStart = svc.binaryPath;
               };
-              users.groups.${svc.group} = {};
-            })
+          }
+          # User overrides (merged on top of defaults)
+          (builtins.removeAttrs svc.service ["script"])
+          # Script handled separately (not in serviceConfig)
+          (lib.mkIf ((svc.service.script or null) != null) {
+            inherit (svc.service) script;
+          })
+        ];
+      })
+      enabled);
 
-            # ── State directory ──────────────────────────────────
-            (lib.mkIf (svc.stateDir != null && svc.user != null) {
-              systemd.tmpfiles.rules = [
-                "d ${svc.stateDir} 0750 ${svc.user} ${svc.group} -"
-              ];
-            })
-
-            # ── Firewall ─────────────────────────────────────────
-            (lib.mkIf (svc.openPorts != []) {
-              networking.firewall.allowedTCPPorts = svc.openPorts;
-            })
-
-            (lib.mkIf (svc.openUDPPorts != []) {
-              networking.firewall.allowedUDPPorts = svc.openUDPPorts;
-            })
-
-            # ── Deployment assertion (only when ExecStart would be auto-generated) ──
-            (lib.mkIf (needsExecStart svc) {
-              assertions = [
-                {
-                  assertion = svc.binaryPath != null;
-                  message = "managedServices.${name}: either deployment.slotPath or deployment.package must be set (needed for auto-generated ExecStart)";
-                }
-              ];
-            })
-
-            # ── Systemd service ──────────────────────────────────
-            (lib.mkIf (svc.service != null) {
-              systemd.services.${svc.serviceName} = lib.mkMerge [
-                # Framework defaults
-                {
-                  wantedBy = ["multi-user.target"];
-                  after = ["network.target"];
-                  serviceConfig =
-                    {
-                      Type = "simple";
-                      Restart = "always";
-                      RestartSec = 10;
-                    }
-                    // svc.hardeningConfig
-                    // lib.optionalAttrs (svc.user != null) {
-                      User = svc.user;
-                      Group = svc.group;
-                    }
-                    // lib.optionalAttrs (needsExecStart svc && svc.binaryPath != null) {
-                      ExecStart = svc.binaryPath;
-                    };
-                }
-                # User overrides (merged on top of defaults)
-                (builtins.removeAttrs svc.service ["script"])
-                # Script handled separately (not in serviceConfig)
-                (lib.mkIf ((svc.service.script or null) != null) {
-                  inherit (svc.service) script;
-                })
-              ];
-            })
-          ]
-      )
-      enabledServices)
-    # ── MQTT ACL accumulation ────────────────────────────────
-    ++ lib.optional (mqttAcls != {}) {
-      mqtt.users =
-        lib.mapAttrs (_user: acls: {
-          acl = acls;
+    # ── MQTT ACL accumulation ─────────────────────────────────────
+    # Multiple services sharing an MQTT user get their ACLs merged
+    # automatically via the module system's list concatenation.
+    mqtt.users = lib.mkIf hasMqtt (
+      lib.mkMerge (lib.mapAttrsToList (_: svc:
+        lib.mkIf (svc.mqtt != null) {
+          ${svc.mqtt.user}.acl = svc.mqtt.acl;
         })
-        mqttAcls;
-    }
-  );
+        enabled)
+    );
+  };
 }
