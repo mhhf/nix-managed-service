@@ -1,7 +1,14 @@
 {
-  description = "Unified self-hosted service framework: declarative service infrastructure generation";
+  description = "Declarative self-hosted service framework for NixOS — generate infrastructure from service declarations";
 
   outputs = _: {
-    nixosModules.default = {imports = [./module.nix ./mqtt.nix];};
+    nixosModules = {
+      # Full framework: managed services + MQTT broker
+      default = {imports = [./module.nix ./mqtt.nix];};
+
+      # Individual components (for selective imports)
+      managed-services = ./module.nix;
+      mqtt-broker = ./mqtt.nix;
+    };
   };
 }
