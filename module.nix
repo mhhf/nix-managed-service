@@ -331,11 +331,11 @@ in {
     systemd.services = lib.mkMerge (lib.mapAttrsToList (name: svc:
       lib.mkIf (svc.service != null) {
         ${svc.serviceName} = lib.mkMerge [
-          # Framework defaults
+          # Framework defaults (mkDefault — user overrides win naturally)
           {
-            wantedBy = ["multi-user.target"];
-            after = ["network.target"];
-            serviceConfig =
+            wantedBy = lib.mkDefault ["multi-user.target"];
+            after = lib.mkDefault ["network.target"];
+            serviceConfig = lib.mapAttrs (_: lib.mkDefault) (
               {
                 Type = "simple";
                 Restart = "always";
@@ -348,7 +348,8 @@ in {
               }
               // lib.optionalAttrs (needsExecStart svc && svc.binaryPath != null) {
                 ExecStart = svc.binaryPath;
-              };
+              }
+            );
           }
           # User overrides (merged on top of defaults)
           (builtins.removeAttrs svc.service ["script"])
