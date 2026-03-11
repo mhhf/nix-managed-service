@@ -87,6 +87,12 @@
         description = "Whether the service is publicly accessible (passed to proxy).";
       };
 
+      websockets = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Whether to enable WebSocket proxying (passed to proxy).";
+      };
+
       # ── Deployment ─────────────────────────────────────────────
       deployment = {
         slotPath = lib.mkOption {
@@ -284,6 +290,7 @@ in {
           // lib.optionalAttrs (svc.locations != null) {inherit (svc) locations;}
           // lib.optionalAttrs (svc.description != null) {inherit (svc) description;}
           // lib.optionalAttrs svc.publicAccess {inherit (svc) publicAccess;}
+          // lib.optionalAttrs (!svc.websockets) {inherit (svc) websockets;}
         ))
         enabled
     );

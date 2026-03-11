@@ -196,6 +196,7 @@ mqtt.users.iot.passwordFile = "/run/secrets/mqtt_password";
 | `target` | nullOr str | `null` | Explicit proxy target URL (overrides port) |
 | `locations` | nullOr (attrsOf anything) | `null` | Custom NGINX location blocks |
 | `publicAccess` | bool | `false` | Whether publicly accessible (passed to proxy) |
+| `websockets` | bool | `true` | Whether to enable WebSocket proxying |
 | `deployment.slotPath` | nullOr str | `null` | Symlink-based deployment slot path |
 | `deployment.package` | nullOr package | `null` | Nix package providing the binary |
 | `deployment.binName` | str | `<name>` | Binary name in package's bin/ directory |
