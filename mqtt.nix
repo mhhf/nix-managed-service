@@ -101,11 +101,12 @@ in {
         {
           inherit (brokerCfg) address port;
           users =
-            lib.mapAttrs (_name: userCfg:
-              {inherit (userCfg) acl;}
-              // lib.optionalAttrs (userCfg.passwordFile != null) {
-                inherit (userCfg) passwordFile;
-              }
+            lib.mapAttrs (
+              _name: userCfg:
+                {inherit (userCfg) acl;}
+                // lib.optionalAttrs (userCfg.passwordFile != null) {
+                  inherit (userCfg) passwordFile;
+                }
             )
             cfg.users;
         }
