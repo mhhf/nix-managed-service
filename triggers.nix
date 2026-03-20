@@ -198,7 +198,7 @@
       # Atomic symlink swap (same mechanism as auto-deploy)
       ln -sfn "$result" ${lib.escapeShellArg "${svc.deployment.slotPath}.tmp"}
       mv -fT ${lib.escapeShellArg "${svc.deployment.slotPath}.tmp"} ${lib.escapeShellArg svc.deployment.slotPath}
-      /run/current-system/sw/bin/sudo /run/current-system/sw/bin/systemctl restart ${svc.deployment.slot.restartUnit}.service
+      /run/wrappers/bin/sudo /run/current-system/sw/bin/systemctl restart ${svc.deployment.slot.restartUnit}
     '';
 in {
   # Fixed-structure config — dynamic computation happens inside each option path,
