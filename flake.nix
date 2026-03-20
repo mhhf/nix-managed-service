@@ -8,8 +8,8 @@
     pkgs = nixpkgs.legacyPackages.${system};
   in {
     nixosModules = {
-      # Full framework: managed services + proxy + slots + health checks + MQTT broker
-      default = {imports = [./module.nix ./proxy.nix ./slots.nix ./health.nix ./mqtt.nix];};
+      # Full framework: managed services + proxy + slots + health checks + MQTT broker + triggers
+      default = {imports = [./module.nix ./proxy.nix ./slots.nix ./health.nix ./mqtt.nix ./triggers.nix];};
 
       # Individual components (for selective imports)
       managed-services = ./module.nix;
@@ -17,6 +17,7 @@
       slots = ./slots.nix;
       health-checks = ./health.nix;
       mqtt-broker = ./mqtt.nix;
+      triggers = ./triggers.nix;
     };
 
     # Library functions for cross-host operations
@@ -216,6 +217,78 @@
           # Verify hardening directives are applied
           machine.succeed("systemctl show strictapp.service -p ProtectSystem | grep -q strict")
           machine.succeed("systemctl show strictapp.service -p NoNewPrivileges | grep -q yes")
+        '';
+      };
+
+      # Test: triggered service with on.schedule
+      trigger-schedule = pkgs.testers.nixosTest {
+        name = "trigger-schedule";
+        nodes.machine = {pkgs, ...}: {
+          imports = [./module.nix ./proxy.nix ./slots.nix ./health.nix ./mqtt.nix ./triggers.nix];
+          managedServices.test-job = {
+            user = "test-job";
+            on.schedule = "minutely";
+            service.script = "echo triggered > /var/lib/jobs/test-job/ran";
+          };
+        };
+        testScript = ''
+          machine.wait_for_unit("multi-user.target")
+          # Verify timer was created
+          machine.succeed("systemctl list-timers | grep -q trigger-test-job")
+          # Verify service is oneshot (smart default)
+          machine.succeed("systemctl show test-job.service -p Type | grep -q oneshot")
+          # Verify service is NOT started at boot (no wantedBy)
+          machine.succeed("! systemctl is-active test-job.service")
+          # Start manually and verify it runs
+          machine.succeed("systemctl start test-job.service")
+          # Verify auto-stateDir was created
+          machine.succeed("test -d /var/lib/jobs/test-job")
+          machine.succeed("test -f /var/lib/jobs/test-job/ran")
+        '';
+      };
+
+      # Test: triggered service with on.ci (MQTT trigger + ACL)
+      trigger-mqtt = pkgs.testers.nixosTest {
+        name = "trigger-mqtt";
+        nodes.machine = {pkgs, ...}: {
+          imports = [./module.nix ./proxy.nix ./slots.nix ./health.nix ./mqtt.nix ./triggers.nix];
+          mqtt.broker.enable = true;
+          managedServices.ci-job = {
+            user = "ci-job";
+            on.ci = "myrepo";
+            service.script = "echo ci-triggered > /tmp/ci-job-ran";
+          };
+        };
+        testScript = ''
+          machine.wait_for_unit("trigger-mqtt.service")
+          # Verify trigger-mqtt daemon is running
+          machine.succeed("systemctl is-active trigger-mqtt.service")
+          # Verify MQTT ACL was generated
+          machine.succeed("grep -q 'git/ci/myrepo' /etc/mosquitto/acl || true")
+          # Verify service is oneshot
+          machine.succeed("systemctl show ci-job.service -p Type | grep -q oneshot")
+        '';
+      };
+
+      # Test: outputDir creates directory and sets env
+      trigger-output = pkgs.testers.nixosTest {
+        name = "trigger-output";
+        nodes.machine = {pkgs, ...}: {
+          imports = [./module.nix ./proxy.nix ./slots.nix ./health.nix ./mqtt.nix ./triggers.nix];
+          managedServices.output-job = {
+            user = "output-job";
+            on.schedule = "yearly";
+            outputDir = "/var/lib/test-output";
+            service.script = "echo $OUTPUT_DIR > /var/lib/jobs/output-job/dir-val";
+          };
+        };
+        testScript = ''
+          machine.wait_for_unit("multi-user.target")
+          # Verify output directory was created
+          machine.succeed("test -d /var/lib/test-output")
+          # Start job and verify OUTPUT_DIR env
+          machine.succeed("systemctl start output-job.service")
+          machine.succeed("grep -q '/var/lib/test-output' /var/lib/jobs/output-job/dir-val")
         '';
       };
 

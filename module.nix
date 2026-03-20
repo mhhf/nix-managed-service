@@ -138,6 +138,55 @@
             '';
           };
         };
+
+        # ── Auto-deploy triggers ────────────────────────────────
+        on = {
+          ci = lib.mkOption {
+            type = lib.types.nullOr (lib.types.either lib.types.str (lib.types.submodule {
+              options = {
+                repo = lib.mkOption {type = lib.types.str;};
+                branch = lib.mkOption {
+                  type = lib.types.str;
+                  default = "main";
+                };
+              };
+            }));
+            default = null;
+            description = "Trigger deploy on CI pass. Same shorthand as on.ci.";
+          };
+
+          schedule = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "Trigger periodic redeploy on this calendar expression.";
+          };
+
+          mqtt = lib.mkOption {
+            type = lib.types.nullOr (lib.types.submodule {
+              options = {
+                topic = lib.mkOption {type = lib.types.str;};
+                filter = lib.mkOption {
+                  type = lib.types.attrsOf lib.types.str;
+                  default = {};
+                };
+              };
+            });
+            default = null;
+            description = "Raw MQTT deploy trigger (escape hatch).";
+          };
+        };
+
+        source = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Path to local source repo (kept current by src-sync).";
+        };
+
+        buildExpr = lib.mkOption {
+          type = lib.types.str;
+          default = ".#default";
+          description = "Nix build expression for deploy script.";
+        };
       };
 
       # ── Computed (read-only) ───────────────────────────────────
@@ -163,7 +212,9 @@
           p = config.hardening;
         in
           if p == "strict"
-          then
+          then let
+            rwPaths = lib.filter (x: x != null) [config.stateDir config.outputDir];
+          in
             {
               DynamicUser = true;
               NoNewPrivileges = true;
@@ -178,19 +229,21 @@
               # user namespace support. If you need namespace restriction, set
               # hardening = "none" and configure serviceConfig manually.
             }
-            // lib.optionalAttrs (config.stateDir != null) {
-              ReadWritePaths = [config.stateDir];
+            // lib.optionalAttrs (rwPaths != []) {
+              ReadWritePaths = rwPaths;
             }
           else if p == "standard"
-          then
+          then let
+            rwPaths = lib.filter (x: x != null) [config.stateDir config.outputDir];
+          in
             {
               NoNewPrivileges = true;
               PrivateTmp = true;
               ProtectSystem = "strict";
               ProtectHome = true;
             }
-            // lib.optionalAttrs (config.stateDir != null) {
-              ReadWritePaths = [config.stateDir];
+            // lib.optionalAttrs (rwPaths != []) {
+              ReadWritePaths = rwPaths;
             }
           else {};
         description = "Computed systemd hardening directives based on the hardening preset.";
@@ -281,6 +334,104 @@
             - "notify": just log a warning to the journal
           '';
         };
+      };
+
+      # ── Triggers (on.*) ─────────────────────────────────────────
+      on = {
+        ci = lib.mkOption {
+          type = lib.types.nullOr (lib.types.either lib.types.str (lib.types.submodule {
+            options = {
+              repo = lib.mkOption {type = lib.types.str;};
+              branch = lib.mkOption {
+                type = lib.types.str;
+                default = "main";
+              };
+            };
+          }));
+          default = null;
+          description = ''
+            Trigger on CI pass. String shorthand:
+              on.ci = "calc"  →  topic git/ci/calc, filter {status=PASS, branch=main}
+            Attrset for custom branch:
+              on.ci = { repo = "calc"; branch = "develop"; }
+          '';
+        };
+
+        schedule = lib.mkOption {
+          type = lib.types.nullOr (lib.types.either lib.types.str (lib.types.submodule {
+            options = {
+              calendar = lib.mkOption {type = lib.types.str;};
+              ifNewCommits = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = ''
+                  Path to a git repo. Skip run (ExecCondition) if HEAD unchanged
+                  since last successful run. SHA stored in stateDir/.last-trigger-sha.
+                '';
+              };
+            };
+          }));
+          default = null;
+          description = ''
+            Schedule trigger. String = always run:
+              on.schedule = "daily"
+            Attrset = conditional:
+              on.schedule = { calendar = "daily"; ifNewCommits = "/var/lib/src/calc"; }
+          '';
+        };
+
+        mqtt = lib.mkOption {
+          type = lib.types.nullOr (lib.types.submodule {
+            options = {
+              topic = lib.mkOption {type = lib.types.str;};
+              filter = lib.mkOption {
+                type = lib.types.attrsOf lib.types.str;
+                default = {};
+              };
+            };
+          });
+          default = null;
+          description = "Raw MQTT trigger for topics outside git/ci/*.";
+        };
+      };
+
+      concurrencyGroup = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Concurrency group name. Services sharing a group are serialized via flock(2).";
+      };
+
+      outputDir = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Output directory for job results. Framework creates it via tmpfiles,
+          adds to ReadWritePaths, and injects OUTPUT_DIR env var.
+        '';
+      };
+
+      outputCommit = lib.mkOption {
+        type = lib.types.nullOr (lib.types.either lib.types.str (lib.types.submodule {
+          options = {
+            message = lib.mkOption {type = lib.types.str;};
+            repo = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Git repo path. Auto-detected from outputDir if null.";
+            };
+            paths = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [];
+              description = "Paths to git add. Defaults to outputDir.";
+            };
+          };
+        }));
+        default = null;
+        description = ''
+          Semantic git commit after job success. String shorthand:
+            outputCommit = "compiled: calc benchmarks"
+          Requires outputDir (or explicit paths in attrset form).
+        '';
       };
 
       # ── MQTT ───────────────────────────────────────────────────
@@ -411,10 +562,12 @@ in {
       })
     enabled);
 
-    # ── State directories ─────────────────────────────────────────
+    # ── State directories + output directories ─────────────────────
     systemd.tmpfiles.rules = lib.concatLists (lib.mapAttrsToList (_: svc:
       lib.optional (svc.stateDir != null && svc.user != null)
-      "d ${svc.stateDir} 0750 ${svc.user} ${svc.group} -")
+      "d ${svc.stateDir} 0750 ${svc.user} ${svc.group} -"
+      ++ lib.optional (svc.outputDir != null && svc.user != null)
+      "d ${svc.outputDir} 0750 ${svc.user} ${svc.group} -")
     enabled);
 
     # ── Firewall ──────────────────────────────────────────────────
@@ -450,6 +603,21 @@ in {
               assertion = false;
               message = "managedServices.${name}: deployment.slot.enable requires slots.enable = true";
             }
+            # outputCommit requires outputDir (unless explicit paths)
+            ++ lib.optional (svc.outputCommit != null && svc.outputDir == null) {
+              assertion = false;
+              message = "managedServices.${name}: outputCommit requires outputDir to be set";
+            }
+            # deployment.on.* requires deployment.source
+            ++ lib.optional ((svc.deployment.on.ci != null || svc.deployment.on.schedule != null || svc.deployment.on.mqtt != null) && svc.deployment.source == null) {
+              assertion = false;
+              message = "managedServices.${name}: deployment.on.* triggers require deployment.source to be set";
+            }
+            # deployment.on.* requires slot.enable
+            ++ lib.optional ((svc.deployment.on.ci != null || svc.deployment.on.schedule != null || svc.deployment.on.mqtt != null) && !svc.deployment.slot.enable) {
+              assertion = false;
+              message = "managedServices.${name}: deployment.on.* triggers require deployment.slot.enable = true";
+            }
         )
         enabled);
 
@@ -477,6 +645,10 @@ in {
               }
             );
           }
+          # OUTPUT_DIR env injection
+          (lib.mkIf (svc.outputDir != null) {
+            environment.OUTPUT_DIR = lib.mkDefault svc.outputDir;
+          })
           # User overrides (merged on top of defaults)
           (builtins.removeAttrs svc.service ["script"])
           # Script handled separately (not in serviceConfig)
