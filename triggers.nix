@@ -183,8 +183,10 @@
       set -euo pipefail
       cd ${lib.escapeShellArg svc.deployment.source}
       result=$(/run/current-system/sw/bin/nix build ${lib.escapeShellArg svc.deployment.buildExpr} \
-        --no-link --print-out-paths 2>/dev/null | tail -1)
-      ${pkgs.rsync}/bin/rsync -a --delete "$result/." "${svc.deployment.slotPath}/"
+        --no-link --print-out-paths 2>&1 | tail -1)
+      # Atomic symlink swap (same mechanism as auto-deploy)
+      ln -sfn "$result" ${lib.escapeShellArg "${svc.deployment.slotPath}.tmp"}
+      mv -fT ${lib.escapeShellArg "${svc.deployment.slotPath}.tmp"} ${lib.escapeShellArg svc.deployment.slotPath}
       /run/current-system/sw/bin/sudo /run/current-system/sw/bin/systemctl restart ${svc.deployment.slot.restartUnit}.service
     '';
 in {
@@ -233,10 +235,25 @@ in {
                   if config ? mqtt && config.mqtt ? port
                   then toString config.mqtt.port
                   else "1883";
+                hasPassword =
+                  config ? mqtt
+                  && config.mqtt ? users
+                  && config.mqtt.users ? trigger-mqtt
+                  && config.mqtt.users.trigger-mqtt ? passwordFile
+                  && config.mqtt.users.trigger-mqtt.passwordFile != null;
+                passwordFile =
+                  if hasPassword
+                  then config.mqtt.users.trigger-mqtt.passwordFile
+                  else null;
               in
                 pkgs.writeShellScript "trigger-mqtt-run" ''
+                  ${lib.optionalString (passwordFile != null) ''
+                    MQTT_PASS=$(cat ${lib.escapeShellArg passwordFile})
+                  ''}
                   exec ${pkgs.mosquitto}/bin/mosquitto_sub \
                     -h ${host} -p ${port} \
+                    -u trigger-mqtt \
+                    ${lib.optionalString (passwordFile != null) ''-P "$MQTT_PASS" \''}
                     ${lib.concatMapStrings (topic: "-t '${topic}' ") uniqueTopics} \
                     -F '{"topic":"%t","payload":%p}' \
                   | ${mqttDispatchScript}
