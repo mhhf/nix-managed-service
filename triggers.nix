@@ -181,6 +181,10 @@
   mkDeployScript = name: svc:
     pkgs.writeShellScript "trigger-deploy-${name}" ''
       set -euo pipefail
+      # Allow nix to read git repos owned by other users (src-sync owns the repos)
+      export GIT_CONFIG_COUNT=1
+      export GIT_CONFIG_KEY_0=safe.directory
+      export GIT_CONFIG_VALUE_0=${lib.escapeShellArg svc.deployment.source}
       cd ${lib.escapeShellArg svc.deployment.source}
       result=$(/run/current-system/sw/bin/nix build ${lib.escapeShellArg svc.deployment.buildExpr} \
         --no-link --print-out-paths 2>&1 | tail -1)
