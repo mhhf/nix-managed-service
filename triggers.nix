@@ -293,7 +293,7 @@ in {
       # Concurrency group flocks
       ++ (lib.mapAttrsToList (_: svc:
         lib.mkIf (svc.concurrencyGroup != null && svc.service != null) {
-          ${svc.serviceName}.serviceConfig.ExecStartPre = ["${pkgs.util-linux}/bin/flock /run/lock/trigger-group-${svc.concurrencyGroup}.lock true"];
+          ${svc.serviceName}.serviceConfig.ExecStartPre = ["${pkgs.util-linux}/bin/flock /run/trigger-locks/${svc.concurrencyGroup}.lock true"];
         })
       allTriggered)
       # outputCommit (ExecStartPost)
@@ -317,8 +317,8 @@ in {
               ExecStart = mkDeployScript name svc;
               ExecStartPre =
                 if svc.concurrencyGroup != null
-                then ["${pkgs.util-linux}/bin/flock /run/lock/trigger-group-${svc.concurrencyGroup}.lock true"]
-                else ["${pkgs.util-linux}/bin/flock /run/lock/trigger-group-deploys.lock true"];
+                then ["${pkgs.util-linux}/bin/flock /run/trigger-locks/${svc.concurrencyGroup}.lock true"]
+                else ["${pkgs.util-linux}/bin/flock /run/trigger-locks/deploys.lock true"];
             };
           };
         })
@@ -339,21 +339,23 @@ in {
       })
       allScheduleTriggers);
 
-    # ── systemd.tmpfiles.rules: auto stateDir for triggered services ──
-    systemd.tmpfiles.rules = lib.concatLists (lib.mapAttrsToList (
-        name: svc:
-          lib.optional (hasJobTrigger svc && svc.stateDir == null)
-          "d ${autoStateDir name svc} 0750 ${
-            if svc.user != null
-            then svc.user
-            else "root"
-          } ${
-            if svc.group != null
-            then svc.group
-            else "root"
-          } -"
-      )
-      jobTriggered);
+    # ── systemd.tmpfiles.rules: lock dir + auto stateDir for triggered services ──
+    systemd.tmpfiles.rules =
+      lib.optional (allTriggered != {}) "d /run/trigger-locks 0777 root root -"
+      ++ lib.concatLists (lib.mapAttrsToList (
+          name: svc:
+            lib.optional (hasJobTrigger svc && svc.stateDir == null)
+            "d ${autoStateDir name svc} 0750 ${
+              if svc.user != null
+              then svc.user
+              else "root"
+            } ${
+              if svc.group != null
+              then svc.group
+              else "root"
+            } -"
+        )
+        jobTriggered);
 
     # ── MQTT ACL for trigger-mqtt user ──────────────────────────
     mqtt.users = lib.mkIf (allMqttTriggers != [] && config ? mqtt && config.mqtt ? users) {
