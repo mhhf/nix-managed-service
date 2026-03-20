@@ -188,6 +188,174 @@ slots = {
 
 The framework creates the slot directory, a deploy user with scoped sudo (can only restart slot-enabled services), and adds the user to `nix.settings.trusted-users` for `nix copy`.
 
+### Triggers and runners
+
+Declare *when* a service should run and the framework generates all the systemd plumbing — timers, MQTT subscriptions, guards, and deploy oneshots. Inspired by GitHub Actions' `on:` syntax.
+
+#### Trigger on CI pass
+
+Run a job whenever a repo's CI succeeds (via MQTT from [pico-ci](https://github.com/mhhf/nix-pico-ci)):
+
+```nix
+managedServices.calc-benchmark = {
+  on.ci = "calc";  # shorthand for: topic "git/ci/calc", filter {status: "PASS", branch: "main"}
+  service.script = "cd /var/lib/src/calc && ./scripts/bench-history.sh 50";
+};
+```
+
+`on.ci = "calc"` expands to an MQTT subscription on `git/ci/calc` that filters for `{status: "PASS", branch: "main"}`. A shared `trigger-mqtt.service` daemon handles all subscriptions.
+
+To trigger on a different branch:
+
+```nix
+on.ci = { repo = "calc"; branch = "develop"; };
+```
+
+#### Trigger on schedule
+
+Run a job on a systemd calendar schedule:
+
+```nix
+managedServices.daily-report = {
+  on.schedule = "daily";
+  service.script = "generate-report > /var/lib/reports/daily.html";
+};
+```
+
+The framework creates a timer with `Persistent=true` (catches up after downtime) and `RandomizedDelaySec=30s` (avoids thundering herd).
+
+#### Schedule with ifNewCommits guard
+
+Only run if the repo has new commits since the last successful run:
+
+```nix
+managedServices.calc-benchmark = {
+  on.schedule = { calendar = "daily"; ifNewCommits = "/var/lib/src/calc"; };
+  service.script = "cd /var/lib/src/calc && ./scripts/bench-history.sh 50";
+};
+```
+
+Uses systemd `ExecCondition` — if HEAD hasn't changed since last run, the service skips cleanly (no failure). On success, the current SHA is recorded in the service's state directory.
+
+#### Smart defaults
+
+Any service with `on.*` triggers automatically gets:
+
+| Default | Value | Why |
+|---------|-------|-----|
+| `Type` | `oneshot` | Jobs run to completion, not as daemons |
+| `Restart` | `no` | Don't restart a finished job |
+| `wantedBy` | `[]` | Don't start at boot — only on trigger |
+| `stateDir` | `/var/lib/jobs/<name>` | Auto-created if not set explicitly |
+
+These use `mkOverride 900`, so explicit `service.serviceConfig` values always win.
+
+#### Output directory and auto-commit
+
+For jobs that produce artifacts, declare an output directory and optional auto-commit:
+
+```nix
+managedServices.calc-benchmark = {
+  on.ci = "calc";
+  outputDir = "/var/lib/src/hq/doc/compiled/calc";
+  outputCommit = "compiled: calc benchmarks";
+  service.script = "cd /var/lib/src/calc && ./scripts/bench-history.sh 50";
+};
+```
+
+- `outputDir` — created automatically, available as `$OUTPUT_DIR` in the service environment, included in `ReadWritePaths` for hardened services
+- `outputCommit` — after the job succeeds, stages changed files and commits with the given message (via `ExecStartPost`)
+
+For more control over the commit:
+
+```nix
+outputCommit = {
+  message = "compiled: calc benchmarks";
+  repo = "/var/lib/src/hq";           # explicit repo path (default: auto-detect from outputDir)
+  paths = ["doc/compiled/calc"];       # specific paths to stage (default: outputDir)
+};
+```
+
+#### Concurrency groups
+
+Serialize jobs that shouldn't run in parallel using `flock(2)`:
+
+```nix
+managedServices.calc-benchmark = {
+  on.ci = "calc";
+  concurrencyGroup = "heavy-jobs";
+  service.script = "...";
+};
+
+managedServices.proof-checker = {
+  on.ci = "proofs";
+  concurrencyGroup = "heavy-jobs";  # shares the lock
+  service.script = "...";
+};
+```
+
+#### Raw MQTT trigger
+
+For events beyond CI, use the MQTT escape hatch:
+
+```nix
+managedServices.light-sync = {
+  on.mqtt = {
+    topic = "zigbee2mqtt/light/set";
+    filter = { state = "ON"; };  # optional JQ filter on payload
+  };
+  service.script = "...";
+};
+```
+
+#### Auto-deploy on trigger
+
+For services with deployment slots, trigger automatic builds and deploys:
+
+```nix
+managedServices.os-web = {
+  domain = "os.example.com";
+  deployment = {
+    slot.enable = true;
+    binName = "os-web";
+    source = "/var/lib/src/os-web";
+    buildExpr = ".#packages.x86_64-linux.default";
+    on.ci = "os-web";  # auto-deploy when CI passes
+  };
+  service = {};
+};
+```
+
+The framework generates an `os-web-deploy.service` oneshot that: builds the flake expression, rsyncs to the slot directory, restarts the service. Deploy services automatically serialize via `flock` (using `concurrencyGroup` if set, otherwise a shared `deploys` lock).
+
+#### Combining triggers
+
+A single service can have multiple triggers — they're independent:
+
+```nix
+managedServices.calc-benchmark = {
+  on.ci = "calc";                                         # run on CI pass
+  on.schedule = { calendar = "daily"; ifNewCommits = "/var/lib/src/calc"; };  # also daily
+  concurrencyGroup = "heavy-jobs";
+  outputDir = "/var/lib/src/hq/doc/compiled/calc";
+  outputCommit = "compiled: calc benchmarks";
+  service.script = "cd /var/lib/src/calc && ./scripts/bench-history.sh 50";
+};
+```
+
+#### What gets generated
+
+| You declare | Framework generates |
+|---|---|
+| `on.ci` | MQTT subscription + dispatch rule in `trigger-mqtt.service`, ACL for `trigger-mqtt` user |
+| `on.schedule` | `trigger-<name>.timer` + `trigger-<name>.service` launcher |
+| `on.schedule.ifNewCommits` | `ExecCondition` guard + SHA tracking in `ExecStartPost` |
+| `on.mqtt` | Same as `on.ci` but with custom topic/filter |
+| `concurrencyGroup` | `ExecStartPre` flock on `/run/lock/trigger-group-<group>.lock` |
+| `outputDir` | Directory via tmpfiles, `$OUTPUT_DIR` env var, `ReadWritePaths` |
+| `outputCommit` | `ExecStartPost` git add + commit |
+| `deployment.on.*` | `<name>-deploy.service` oneshot (build + rsync + restart) |
+
 ### Container services
 
 For services in NixOS containers, use `target` instead of `port`:
@@ -280,6 +448,7 @@ Import everything with `nixosModules.default`, or pick individual components:
 | `slots` | `nixosModules.slots` | Only `slots.*` (deploy infrastructure) |
 | `health-checks` | `nixosModules.health-checks` | Only health check timers |
 | `mqtt-broker` | `nixosModules.mqtt-broker` | Only `mqtt.*` (Mosquitto + ACLs) |
+| `triggers` | `nixosModules.triggers` | Only trigger infrastructure (`on.*`, deploy oneshots) |
 
 ## Port auto-detection
 
@@ -322,6 +491,17 @@ jellyfin (8096), grafana (3000), prometheus (9090), alertmanager (9093), transmi
 | `healthCheck.interval` | str | `"60s"` | Check interval |
 | `healthCheck.timeoutSec` | int | `10` | Timeout in seconds |
 | `healthCheck.onFailure` | enum | `"notify"` | `"restart"` or `"notify"` |
+| `on.ci` | nullOr (str or {repo, branch}) | `null` | CI trigger — string is repo name shorthand |
+| `on.schedule` | nullOr (str or {calendar, ifNewCommits}) | `null` | Schedule trigger — string is calendar shorthand |
+| `on.mqtt` | nullOr {topic, filter} | `null` | Raw MQTT trigger |
+| `concurrencyGroup` | nullOr str | `null` | Serialize via flock with other services in same group |
+| `outputDir` | nullOr str | `null` | Output directory (auto-created, `$OUTPUT_DIR` env) |
+| `outputCommit` | nullOr (str or {message, repo, paths}) | `null` | Auto-commit after success |
+| `deployment.on.ci` | nullOr (str or {repo, branch}) | `null` | CI trigger for auto-deploy |
+| `deployment.on.schedule` | nullOr str | `null` | Schedule trigger for auto-deploy |
+| `deployment.on.mqtt` | nullOr {topic, filter} | `null` | MQTT trigger for auto-deploy |
+| `deployment.source` | nullOr str | `null` | Source directory for auto-deploy builds |
+| `deployment.buildExpr` | str | `".#default"` | Nix build expression for auto-deploy |
 | `mqtt.user` | str | — | MQTT username |
 | `mqtt.acl` | listOf str | `[]` | MQTT ACL rules |
 
