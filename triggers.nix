@@ -178,22 +178,15 @@
         ${pkgs.git}/bin/git -C "$repo" commit -m ${lib.escapeShellArg commitCfg.message}
     '';
 
-  # Build a flake ref that uses the path: fetcher instead of git+file:
-  # This avoids libgit2's safe.directory ownership check when the deploy
-  # user differs from the repo owner (src-sync).
-  deployBuildRef = svc: let
-    expr = svc.deployment.buildExpr;
-  in
-    if lib.hasPrefix ".#" expr
-    then "path:${svc.deployment.source}#${lib.removePrefix ".#" expr}"
-    else if lib.hasPrefix "./" expr
-    then "path:${svc.deployment.source}/${lib.removePrefix "./" (builtins.head (lib.splitString "#" expr))}#${builtins.elemAt (lib.splitString "#" expr) 1}"
-    else expr;
-
   mkDeployScript = name: svc:
     pkgs.writeShellScript "trigger-deploy-${name}" ''
       set -euo pipefail
-      result=$(/run/current-system/sw/bin/nix build ${lib.escapeShellArg (deployBuildRef svc)} \
+      # Ensure nix/libgit2 can read source repos owned by other users.
+      # GIT_CONFIG_GLOBAL env var is ignored by nix's bundled libgit2,
+      # but ~/.gitconfig is respected.
+      ${pkgs.git}/bin/git config --global safe.directory '*'
+      cd ${lib.escapeShellArg svc.deployment.source}
+      result=$(/run/current-system/sw/bin/nix build ${lib.escapeShellArg svc.deployment.buildExpr} \
         --no-link --print-out-paths | tail -1)
       # Atomic symlink swap (same mechanism as auto-deploy)
       ln -sfn "$result" ${lib.escapeShellArg "${svc.deployment.slotPath}.tmp"}
