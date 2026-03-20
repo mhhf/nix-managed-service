@@ -194,7 +194,7 @@ Declare *when* a service should run and the framework generates all the systemd 
 
 #### Trigger on CI pass
 
-Run a job whenever a repo's CI succeeds (via MQTT from [pico-ci](https://github.com/mhhf/nix-pico-ci)):
+Run a job whenever a repo's CI succeeds. The `on.ci` shorthand expects an MQTT message on `git/ci/<repo>` with a JSON payload containing `status` and `branch` fields — any CI system that publishes in this format will work:
 
 ```nix
 managedServices.calc-benchmark = {
