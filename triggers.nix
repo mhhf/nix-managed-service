@@ -311,6 +311,7 @@ in {
           "${name}-deploy" = {
             description = "Deploy ${name} from local source";
             wantedBy = [];
+            path = [pkgs.git];
             serviceConfig = {
               Type = "oneshot";
               Restart = "no";
