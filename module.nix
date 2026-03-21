@@ -697,266 +697,271 @@ in {
       lib.filter (d: d != null)
       (lib.mapAttrsToList (_: svc: svc.domain) enabled);
     uniqueDomains = lib.unique allDomains;
-  in {
-    # ── Proxy registration ────────────────────────────────────────
-    proxy.services = lib.mapAttrs (_name: svc:
-      lib.mkIf (svc.domain != null) (
-        {
-          enable = true;
-          inherit (svc) domain;
-        }
-        // lib.optionalAttrs (svc.port != null) {inherit (svc) port;}
-        // lib.optionalAttrs (svc.target != null) {inherit (svc) target;}
-        // lib.optionalAttrs (svc.locations != null) {inherit (svc) locations;}
-        // lib.optionalAttrs (svc.description != null) {inherit (svc) description;}
-        // lib.optionalAttrs svc.publicAccess {inherit (svc) publicAccess;}
-        // lib.optionalAttrs (!svc.websockets) {inherit (svc) websockets;}
-      ))
-    enabled;
-
-    # ── Users and groups ──────────────────────────────────────────
-    users.users = lib.mkMerge (lib.mapAttrsToList (_: svc:
-      lib.mkIf (svc.user != null) {
-        ${svc.user} = {
-          isSystemUser = true;
-          group = svc.group;
-          home = lib.mkIf (svc.stateDir != null) svc.stateDir;
-          createHome = lib.mkIf (svc.stateDir != null) true;
-        };
-      })
-    enabled);
-
-    users.groups = lib.mkMerge (lib.mapAttrsToList (_: svc:
-      lib.mkIf (svc.user != null) {
-        ${svc.group} = {};
-      })
-    enabled);
-
-    # ── State directories + output directories ─────────────────────
-    systemd.tmpfiles.rules = lib.concatLists (lib.mapAttrsToList (_: svc:
-      lib.optional (svc.stateDir != null && svc.user != null)
-      "d ${svc.stateDir} 0750 ${svc.user} ${svc.group} -"
-      ++ lib.optional (svc.outputDir != null && svc.user != null)
-      "d ${svc.outputDir} 0750 ${svc.user} ${svc.group} -"
-      ++ lib.mapAttrsToList (_: dir: let
-        u =
-          if dir.user != null
-          then dir.user
-          else if svc.user != null
-          then svc.user
-          else "root";
-        g =
-          if dir.group != null
-          then dir.group
-          else if svc.group != null
-          then svc.group
-          else "root";
-      in "d ${dir.path} ${dir.mode} ${u} ${g} -")
-      svc.extraDirs)
-    enabled);
-
-    # ── Firewall ──────────────────────────────────────────────────
-    networking.firewall.allowedTCPPorts =
-      lib.concatLists (lib.mapAttrsToList (_: svc: svc.openPorts) enabled);
-
-    networking.firewall.allowedUDPPorts =
-      lib.concatLists (lib.mapAttrsToList (_: svc: svc.openUDPPorts) enabled);
-
-    # ── Assertions ───────────────────────────────────────────────
-    assertions =
-      # Domain collision detection
-      [
-        {
-          assertion = builtins.length allDomains == builtins.length uniqueDomains;
-          message = "managedServices: duplicate domain detected — each service must have a unique domain";
-        }
-      ]
-      ++ lib.concatLists (lib.mapAttrsToList (
-          name: svc:
-          # Deployment: ExecStart needs a binary
-            lib.optional (needsExecStart svc) {
-              assertion = svc.binaryPath != null;
-              message = "managedServices.${name}: either deployment.slotPath or deployment.package must be set (needed for auto-generated ExecStart)";
-            }
-            # Health check: at most one type
-            ++ lib.optional (healthCheckCount svc > 1) {
-              assertion = false;
-              message = "managedServices.${name}: healthCheck.http, .tcp, and .exec are mutually exclusive — set only one";
-            }
-            # Slot: requires fleet-level slots.enable
-            ++ lib.optional (svc.deployment.slot.enable && !(config.slots.enable or false)) {
-              assertion = false;
-              message = "managedServices.${name}: deployment.slot.enable requires slots.enable = true";
-            }
-            # outputCommit requires outputDir (unless explicit paths)
-            ++ lib.optional (svc.outputCommit != null && svc.outputDir == null) {
-              assertion = false;
-              message = "managedServices.${name}: outputCommit requires outputDir to be set";
-            }
-            # deployment.on.* requires deployment.source
-            ++ lib.optional ((svc.deployment.on.ci != null || svc.deployment.on.schedule != null || svc.deployment.on.mqtt != null) && svc.deployment.source == null) {
-              assertion = false;
-              message = "managedServices.${name}: deployment.on.* triggers require deployment.source to be set";
-            }
-            # deployment.on.* requires slot.enable
-            ++ lib.optional ((svc.deployment.on.ci != null || svc.deployment.on.schedule != null || svc.deployment.on.mqtt != null) && !svc.deployment.slot.enable) {
-              assertion = false;
-              message = "managedServices.${name}: deployment.on.* triggers require deployment.slot.enable = true";
-            }
-            # secrets.sopsFile required when string shorthand is used in envVars/credentials
-            ++ lib.optional (svc.secrets.sopsFile
-              == null
-              && (
-                lib.any builtins.isString (lib.attrValues svc.secrets.envVars)
-                || lib.any builtins.isString (lib.attrValues svc.secrets.credentials)
-              )) {
-              assertion = false;
-              message = "managedServices.${name}: secrets.sopsFile must be set when using string shorthand in envVars/credentials";
-            }
-            # Each secrets.files entry must have sopsFile coverage
-            ++ lib.concatLists (lib.mapAttrsToList (
-                fileName: spec:
-                  lib.optional (spec.sopsFile == null && svc.secrets.sopsFile == null) {
-                    assertion = false;
-                    message = "managedServices.${name}: secrets.files.${fileName} has no sopsFile (set it on the file or on secrets.sopsFile)";
-                  }
-              )
-              svc.secrets.files)
-        )
-        enabled);
-
-    # ── Sops secrets integration ─────────────────────────────────
-    sops.secrets = lib.mkIf hasSops (lib.mkMerge (lib.mapAttrsToList (name: svc: let
-      envSecrets =
-        lib.mapAttrs' (_envName: spec: let
-          resolved = resolveSecretSpec spec svc.secrets.sopsFile;
-        in {
-          name = secretAttrName name resolved.key;
-          value = {
-            inherit (resolved) sopsFile key;
-            mode = "0400";
-            owner = lib.mkIf (svc.user != null) svc.user;
-            restartUnits = computeRestartUnits name svc;
-          };
-        })
-        svc.secrets.envVars;
-      credSecrets =
-        lib.mapAttrs' (credName: spec: let
-          resolved = resolveSecretSpec spec svc.secrets.sopsFile;
-        in {
-          name = "${name}-${credName}";
-          value = {
-            inherit (resolved) sopsFile key;
-            mode = "0400";
-            owner = lib.mkIf (svc.user != null) svc.user;
-            restartUnits = computeRestartUnits name svc;
-          };
-        })
-        svc.secrets.credentials;
-      fileSecrets =
-        lib.mapAttrs' (fileName: spec: let
-          effectiveOwner =
-            if spec.owner != null
-            then spec.owner
-            else svc.user;
-        in {
-          name = "${name}-${fileName}";
-          value = {
-            sopsFile =
-              if spec.sopsFile != null
-              then spec.sopsFile
-              else svc.secrets.sopsFile;
-            inherit (spec) key format mode;
-            owner = lib.mkIf (effectiveOwner != null) effectiveOwner;
-            restartUnits = computeRestartUnits name svc;
-          };
-        })
-        svc.secrets.files;
-    in
-      lib.mkIf (hasAnySec svc) (envSecrets // credSecrets // fileSecrets))
-    enabled));
-
-    sops.templates = lib.mkIf hasSops (lib.mkMerge (lib.mapAttrsToList (name: svc:
-      lib.mkIf (svc.secrets.envVars != {}) {
-        "${name}-env" = {
-          content = lib.concatStringsSep "\n" (lib.mapAttrsToList (envName: spec: let
-            resolved = resolveSecretSpec spec svc.secrets.sopsFile;
-          in "${envName}=${outerConfig.sops.placeholder.${secretAttrName name resolved.key}}")
-          svc.secrets.envVars);
-          mode = "0400";
-          owner = lib.mkIf (svc.user != null) svc.user;
-          restartUnits = computeRestartUnits name svc;
-        };
-      })
-    enabled));
-
-    # ── Systemd services ──────────────────────────────────────────
-    systemd.services = lib.mkMerge (lib.mapAttrsToList (name: svc:
-      lib.mkIf (svc.service != null) {
-        ${svc.serviceName} = lib.mkMerge [
-          # Framework defaults (mkDefault — user overrides win naturally)
+  in
+    {
+      # ── Proxy registration ────────────────────────────────────────
+      proxy.services = lib.mapAttrs (_name: svc:
+        lib.mkIf (svc.domain != null) (
           {
-            wantedBy = lib.mkDefault ["multi-user.target"];
-            after = lib.mkDefault ["network.target"];
-            serviceConfig = lib.mapAttrs (_: lib.mkDefault) (
-              {
-                Type = "simple";
-                Restart = "always";
-                RestartSec = 10;
-              }
-              // svc.hardeningConfig
-              // lib.optionalAttrs (svc.user != null) {
-                User = svc.user;
-                Group = svc.group;
-              }
-              // lib.optionalAttrs (needsExecStart svc && svc.binaryPath != null) {
-                ExecStart = svc.binaryPath;
-              }
-            );
+            enable = true;
+            inherit (svc) domain;
           }
-          # OUTPUT_DIR env injection
-          (lib.mkIf (svc.outputDir != null) {
-            environment.OUTPUT_DIR = lib.mkDefault svc.outputDir;
-          })
-          # Runtime hint: NODE_ENV=production for Node.js services
-          (lib.mkIf (svc.runtime == "node") {
-            environment.NODE_ENV = lib.mkDefault "production";
-          })
-          # Secrets: EnvironmentFile from sops.templates
-          (lib.mkIf (hasSops && svc.secrets.envVars != {}) {
-            serviceConfig.EnvironmentFile = outerConfig.sops.templates."${name}-env".path;
-          })
-          # Secrets: LoadCredential from sops.secrets
-          (lib.mkIf (hasSops && svc.secrets.credentials != {}) {
-            serviceConfig.LoadCredential = lib.mapAttrsToList (credName: spec: let
-              resolved = resolveSecretSpec spec svc.secrets.sopsFile;
-            in "${credName}:${outerConfig.sops.secrets."${name}-${credName}".path}")
-            svc.secrets.credentials;
-          })
-          # Secrets: auto after/wants sops-nix.service
-          (lib.mkIf (hasSops && hasAnySec svc) {
-            after = ["sops-nix.service"];
-            wants = ["sops-nix.service"];
-          })
-          # User overrides (merged on top of defaults)
-          (builtins.removeAttrs svc.service ["script"])
-          # Script handled separately (not in serviceConfig)
-          (lib.mkIf ((svc.service.script or null) != null) {
-            inherit (svc.service) script;
-          })
-        ];
-      })
-    enabled);
+          // lib.optionalAttrs (svc.port != null) {inherit (svc) port;}
+          // lib.optionalAttrs (svc.target != null) {inherit (svc) target;}
+          // lib.optionalAttrs (svc.locations != null) {inherit (svc) locations;}
+          // lib.optionalAttrs (svc.description != null) {inherit (svc) description;}
+          // lib.optionalAttrs svc.publicAccess {inherit (svc) publicAccess;}
+          // lib.optionalAttrs (!svc.websockets) {inherit (svc) websockets;}
+        ))
+      enabled;
 
-    # ── MQTT ACL accumulation ─────────────────────────────────────
-    # Multiple services sharing an MQTT user get their ACLs merged
-    # automatically via the module system's list concatenation.
-    mqtt.users = lib.mkIf hasMqtt (
-      lib.mkMerge (lib.mapAttrsToList (_: svc:
-        lib.mkIf (svc.mqtt != null) {
-          ${svc.mqtt.user}.acl = svc.mqtt.acl;
+      # ── Users and groups ──────────────────────────────────────────
+      users.users = lib.mkMerge (lib.mapAttrsToList (_: svc:
+        lib.mkIf (svc.user != null) {
+          ${svc.user} = {
+            isSystemUser = true;
+            group = svc.group;
+            home = lib.mkIf (svc.stateDir != null) svc.stateDir;
+            createHome = lib.mkIf (svc.stateDir != null) true;
+          };
         })
-      enabled)
-    );
-  };
+      enabled);
+
+      users.groups = lib.mkMerge (lib.mapAttrsToList (_: svc:
+        lib.mkIf (svc.user != null) {
+          ${svc.group} = {};
+        })
+      enabled);
+
+      # ── State directories + output directories ─────────────────────
+      systemd.tmpfiles.rules = lib.concatLists (lib.mapAttrsToList (_: svc:
+        lib.optional (svc.stateDir != null && svc.user != null)
+        "d ${svc.stateDir} 0750 ${svc.user} ${svc.group} -"
+        ++ lib.optional (svc.outputDir != null && svc.user != null)
+        "d ${svc.outputDir} 0750 ${svc.user} ${svc.group} -"
+        ++ lib.mapAttrsToList (_: dir: let
+          u =
+            if dir.user != null
+            then dir.user
+            else if svc.user != null
+            then svc.user
+            else "root";
+          g =
+            if dir.group != null
+            then dir.group
+            else if svc.group != null
+            then svc.group
+            else "root";
+        in "d ${dir.path} ${dir.mode} ${u} ${g} -")
+        svc.extraDirs)
+      enabled);
+
+      # ── Firewall ──────────────────────────────────────────────────
+      networking.firewall.allowedTCPPorts =
+        lib.concatLists (lib.mapAttrsToList (_: svc: svc.openPorts) enabled);
+
+      networking.firewall.allowedUDPPorts =
+        lib.concatLists (lib.mapAttrsToList (_: svc: svc.openUDPPorts) enabled);
+
+      # ── Assertions ───────────────────────────────────────────────
+      assertions =
+        # Domain collision detection
+        [
+          {
+            assertion = builtins.length allDomains == builtins.length uniqueDomains;
+            message = "managedServices: duplicate domain detected — each service must have a unique domain";
+          }
+        ]
+        ++ lib.concatLists (lib.mapAttrsToList (
+            name: svc:
+            # Deployment: ExecStart needs a binary
+              lib.optional (needsExecStart svc) {
+                assertion = svc.binaryPath != null;
+                message = "managedServices.${name}: either deployment.slotPath or deployment.package must be set (needed for auto-generated ExecStart)";
+              }
+              # Health check: at most one type
+              ++ lib.optional (healthCheckCount svc > 1) {
+                assertion = false;
+                message = "managedServices.${name}: healthCheck.http, .tcp, and .exec are mutually exclusive — set only one";
+              }
+              # Slot: requires fleet-level slots.enable
+              ++ lib.optional (svc.deployment.slot.enable && !(config.slots.enable or false)) {
+                assertion = false;
+                message = "managedServices.${name}: deployment.slot.enable requires slots.enable = true";
+              }
+              # outputCommit requires outputDir (unless explicit paths)
+              ++ lib.optional (svc.outputCommit != null && svc.outputDir == null) {
+                assertion = false;
+                message = "managedServices.${name}: outputCommit requires outputDir to be set";
+              }
+              # deployment.on.* requires deployment.source
+              ++ lib.optional ((svc.deployment.on.ci != null || svc.deployment.on.schedule != null || svc.deployment.on.mqtt != null) && svc.deployment.source == null) {
+                assertion = false;
+                message = "managedServices.${name}: deployment.on.* triggers require deployment.source to be set";
+              }
+              # deployment.on.* requires slot.enable
+              ++ lib.optional ((svc.deployment.on.ci != null || svc.deployment.on.schedule != null || svc.deployment.on.mqtt != null) && !svc.deployment.slot.enable) {
+                assertion = false;
+                message = "managedServices.${name}: deployment.on.* triggers require deployment.slot.enable = true";
+              }
+              # secrets.sopsFile required when string shorthand is used in envVars/credentials
+              ++ lib.optional (svc.secrets.sopsFile
+                == null
+                && (
+                  lib.any builtins.isString (lib.attrValues svc.secrets.envVars)
+                  || lib.any builtins.isString (lib.attrValues svc.secrets.credentials)
+                )) {
+                assertion = false;
+                message = "managedServices.${name}: secrets.sopsFile must be set when using string shorthand in envVars/credentials";
+              }
+              # Each secrets.files entry must have sopsFile coverage
+              ++ lib.concatLists (lib.mapAttrsToList (
+                  fileName: spec:
+                    lib.optional (spec.sopsFile == null && svc.secrets.sopsFile == null) {
+                      assertion = false;
+                      message = "managedServices.${name}: secrets.files.${fileName} has no sopsFile (set it on the file or on secrets.sopsFile)";
+                    }
+                )
+                svc.secrets.files)
+          )
+          enabled);
+
+      # ── Systemd services ──────────────────────────────────────────
+      systemd.services = lib.mkMerge (lib.mapAttrsToList (name: svc:
+        lib.mkIf (svc.service != null) {
+          ${svc.serviceName} = lib.mkMerge [
+            # Framework defaults (mkDefault — user overrides win naturally)
+            {
+              wantedBy = lib.mkDefault ["multi-user.target"];
+              after = lib.mkDefault ["network.target"];
+              serviceConfig = lib.mapAttrs (_: lib.mkDefault) (
+                {
+                  Type = "simple";
+                  Restart = "always";
+                  RestartSec = 10;
+                }
+                // svc.hardeningConfig
+                // lib.optionalAttrs (svc.user != null) {
+                  User = svc.user;
+                  Group = svc.group;
+                }
+                // lib.optionalAttrs (needsExecStart svc && svc.binaryPath != null) {
+                  ExecStart = svc.binaryPath;
+                }
+              );
+            }
+            # OUTPUT_DIR env injection
+            (lib.mkIf (svc.outputDir != null) {
+              environment.OUTPUT_DIR = lib.mkDefault svc.outputDir;
+            })
+            # Runtime hint: NODE_ENV=production for Node.js services
+            (lib.mkIf (svc.runtime == "node") {
+              environment.NODE_ENV = lib.mkDefault "production";
+            })
+            # Secrets: EnvironmentFile from sops.templates
+            (lib.mkIf (hasSops && svc.secrets.envVars != {}) {
+              serviceConfig.EnvironmentFile = outerConfig.sops.templates."${name}-env".path;
+            })
+            # Secrets: LoadCredential from sops.secrets
+            (lib.mkIf (hasSops && svc.secrets.credentials != {}) {
+              serviceConfig.LoadCredential = lib.mapAttrsToList (credName: spec: let
+                resolved = resolveSecretSpec spec svc.secrets.sopsFile;
+              in "${credName}:${outerConfig.sops.secrets."${name}-${credName}".path}")
+              svc.secrets.credentials;
+            })
+            # Secrets: auto after/wants sops-nix.service
+            (lib.mkIf (hasSops && hasAnySec svc) {
+              after = ["sops-nix.service"];
+              wants = ["sops-nix.service"];
+            })
+            # User overrides (merged on top of defaults)
+            (builtins.removeAttrs svc.service ["script"])
+            # Script handled separately (not in serviceConfig)
+            (lib.mkIf ((svc.service.script or null) != null) {
+              inherit (svc.service) script;
+            })
+          ];
+        })
+      enabled);
+
+      # ── MQTT ACL accumulation ─────────────────────────────────────
+      # Multiple services sharing an MQTT user get their ACLs merged
+      # automatically via the module system's list concatenation.
+      mqtt.users = lib.mkIf hasMqtt (
+        lib.mkMerge (lib.mapAttrsToList (_: svc:
+          lib.mkIf (svc.mqtt != null) {
+            ${svc.mqtt.user}.acl = svc.mqtt.acl;
+          })
+        enabled)
+      );
+    }
+    // lib.optionalAttrs hasSops {
+      # ── Sops secrets integration ─────────────────────────────────
+      # Guarded by optionalAttrs (not mkIf) because the sops option namespace
+      # only exists when sops-nix is imported. mkIf would still create a
+      # definition entry that the module system rejects.
+      sops.secrets = lib.mkMerge (lib.mapAttrsToList (name: svc: let
+        envSecrets =
+          lib.mapAttrs' (_envName: spec: let
+            resolved = resolveSecretSpec spec svc.secrets.sopsFile;
+          in {
+            name = secretAttrName name resolved.key;
+            value = {
+              inherit (resolved) sopsFile key;
+              mode = "0400";
+              owner = lib.mkIf (svc.user != null) svc.user;
+              restartUnits = computeRestartUnits name svc;
+            };
+          })
+          svc.secrets.envVars;
+        credSecrets =
+          lib.mapAttrs' (credName: spec: let
+            resolved = resolveSecretSpec spec svc.secrets.sopsFile;
+          in {
+            name = "${name}-${credName}";
+            value = {
+              inherit (resolved) sopsFile key;
+              mode = "0400";
+              owner = lib.mkIf (svc.user != null) svc.user;
+              restartUnits = computeRestartUnits name svc;
+            };
+          })
+          svc.secrets.credentials;
+        fileSecrets =
+          lib.mapAttrs' (fileName: spec: let
+            effectiveOwner =
+              if spec.owner != null
+              then spec.owner
+              else svc.user;
+          in {
+            name = "${name}-${fileName}";
+            value = {
+              sopsFile =
+                if spec.sopsFile != null
+                then spec.sopsFile
+                else svc.secrets.sopsFile;
+              inherit (spec) key format mode;
+              owner = lib.mkIf (effectiveOwner != null) effectiveOwner;
+              restartUnits = computeRestartUnits name svc;
+            };
+          })
+          svc.secrets.files;
+      in
+        lib.mkIf (hasAnySec svc) (envSecrets // credSecrets // fileSecrets))
+      enabled);
+
+      sops.templates = lib.mkMerge (lib.mapAttrsToList (name: svc:
+        lib.mkIf (svc.secrets.envVars != {}) {
+          "${name}-env" = {
+            content = lib.concatStringsSep "\n" (lib.mapAttrsToList (envName: spec: let
+              resolved = resolveSecretSpec spec svc.secrets.sopsFile;
+            in "${envName}=${outerConfig.sops.placeholder.${secretAttrName name resolved.key}}")
+            svc.secrets.envVars);
+            mode = "0400";
+            owner = lib.mkIf (svc.user != null) svc.user;
+            restartUnits = computeRestartUnits name svc;
+          };
+        })
+      enabled);
+    };
 }
