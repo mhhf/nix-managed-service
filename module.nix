@@ -32,11 +32,53 @@
   ...
 }: let
   outerConfig = config;
+
+  # ── Secrets helpers ───────────────────────────────────────────
+  hasSops = options ? sops && options.sops ? secrets;
+
+  secretSpecType = lib.types.either lib.types.str (lib.types.submodule {
+    options = {
+      key = lib.mkOption {
+        type = lib.types.str;
+        description = "Key in sops file";
+      };
+      sopsFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "Override sops file for this secret";
+      };
+    };
+  });
+
+  resolveSecretSpec = spec: defaultSopsFile:
+    if builtins.isString spec
+    then {
+      key = spec;
+      sopsFile = defaultSopsFile;
+    }
+    else {
+      inherit (spec) key;
+      sopsFile =
+        if spec.sopsFile != null
+        then spec.sopsFile
+        else defaultSopsFile;
+    };
+
+  secretAttrName = svcName: key: "${svcName}-${key}";
+
+  computeRestartUnits = name: svc:
+    svc.secrets.restartUnits
+    ++ lib.optional (svc.service != null) "${svc.serviceName}.service";
+
+  hasAnySec = svc: svc.secrets.envVars != {} || svc.secrets.credentials != {} || svc.secrets.files != {};
+
   managedServiceModule = lib.types.submodule ({
     name,
     config,
     ...
-  }: {
+  }: let
+    svcName = name;
+  in {
     options = {
       enable = lib.mkOption {
         type = lib.types.bool;
@@ -213,7 +255,9 @@
         in
           if p == "strict"
           then let
-            rwPaths = lib.filter (x: x != null) [config.stateDir config.outputDir];
+            rwPaths =
+              lib.filter (x: x != null) [config.stateDir config.outputDir]
+              ++ lib.mapAttrsToList (_: d: d.path) config.extraDirs;
           in
             {
               DynamicUser = true;
@@ -234,7 +278,9 @@
             }
           else if p == "standard"
           then let
-            rwPaths = lib.filter (x: x != null) [config.stateDir config.outputDir];
+            rwPaths =
+              lib.filter (x: x != null) [config.stateDir config.outputDir]
+              ++ lib.mapAttrsToList (_: d: d.path) config.extraDirs;
           in
             {
               NoNewPrivileges = true;
@@ -475,6 +521,130 @@
           explicit ExecStart is provided.
         '';
       };
+
+      # ── Secrets ───────────────────────────────────────────────────
+      secrets = {
+        sopsFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.path;
+          default = null;
+          description = "Default sops file for this service's secrets.";
+        };
+
+        envVars = lib.mkOption {
+          type = lib.types.attrsOf secretSpecType;
+          default = {};
+          description = ''
+            Environment variables populated from sops secrets.
+            String shorthand: envVars.FOO = "foo_key" → reads "foo_key" from secrets.sopsFile.
+            Attrset: envVars.FOO = { key = "foo_key"; sopsFile = ./other.yaml; }.
+            Generates sops.secrets + sops.templates env file + EnvironmentFile on service.
+          '';
+          example = {
+            TELEGRAM_BOT_TOKEN = "telegram_bot_token";
+            API_KEY = {
+              key = "my_api_key";
+              sopsFile = ./keys.yaml;
+            };
+          };
+        };
+
+        credentials = lib.mkOption {
+          type = lib.types.attrsOf secretSpecType;
+          default = {};
+          description = ''
+            Secrets exposed via systemd LoadCredential.
+            String shorthand: credentials.mqtt-password = "mqtt_pw_key".
+            Service reads via: cat $CREDENTIALS_DIRECTORY/mqtt-password
+            Generates sops.secrets + LoadCredential on the systemd service.
+          '';
+        };
+
+        files = lib.mkOption {
+          type = lib.types.attrsOf (lib.types.submodule ({name, ...}: {
+            options = {
+              key = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Key in sops file. null or empty string = whole file.";
+              };
+              sopsFile = lib.mkOption {
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = "Override sops file for this secret file.";
+              };
+              format = lib.mkOption {
+                type = lib.types.str;
+                default = "yaml";
+                description = "Sops file format (yaml, json, binary, etc.)";
+              };
+              mode = lib.mkOption {
+                type = lib.types.str;
+                default = "0400";
+              };
+              owner = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Override owner (defaults to service user).";
+              };
+              path = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                readOnly = true;
+                default =
+                  if hasSops
+                  then outerConfig.sops.secrets."${svcName}-${name}".path
+                  else null;
+                description = "Resolved sops secret path. Null when sops-nix is not loaded.";
+              };
+            };
+          }));
+          default = {};
+          description = ''
+            Named secret files. Each generates a sops.secrets entry.
+            The resolved path is available as secrets.files.<name>.path (read-only).
+          '';
+        };
+
+        restartUnits = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [];
+          description = ''
+            Extra units to restart when secrets change.
+            The service's own unit is auto-added when service != null.
+          '';
+        };
+      };
+
+      # ── Runtime hint ──────────────────────────────────────────────
+      runtime = lib.mkOption {
+        type = lib.types.nullOr (lib.types.enum ["node"]);
+        default = null;
+        description = "Runtime hint. 'node' auto-sets NODE_ENV=production.";
+      };
+
+      # ── Extra directories ─────────────────────────────────────────
+      extraDirs = lib.mkOption {
+        type = lib.types.attrsOf (lib.types.submodule {
+          options = {
+            path = lib.mkOption {type = lib.types.str;};
+            mode = lib.mkOption {
+              type = lib.types.str;
+              default = "0750";
+            };
+            user = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Owner user (defaults to service user).";
+            };
+            group = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Owner group (defaults to service group).";
+            };
+          };
+        });
+        default = {};
+        description = "Additional directories to create via tmpfiles (beyond stateDir).";
+      };
     };
   });
 in {
@@ -567,7 +737,22 @@ in {
       lib.optional (svc.stateDir != null && svc.user != null)
       "d ${svc.stateDir} 0750 ${svc.user} ${svc.group} -"
       ++ lib.optional (svc.outputDir != null && svc.user != null)
-      "d ${svc.outputDir} 0750 ${svc.user} ${svc.group} -")
+      "d ${svc.outputDir} 0750 ${svc.user} ${svc.group} -"
+      ++ lib.mapAttrsToList (_: dir: let
+        u =
+          if dir.user != null
+          then dir.user
+          else if svc.user != null
+          then svc.user
+          else "root";
+        g =
+          if dir.group != null
+          then dir.group
+          else if svc.group != null
+          then svc.group
+          else "root";
+      in "d ${dir.path} ${dir.mode} ${u} ${g} -")
+      svc.extraDirs)
     enabled);
 
     # ── Firewall ──────────────────────────────────────────────────
@@ -618,8 +803,92 @@ in {
               assertion = false;
               message = "managedServices.${name}: deployment.on.* triggers require deployment.slot.enable = true";
             }
+            # secrets.sopsFile required when string shorthand is used in envVars/credentials
+            ++ lib.optional (svc.secrets.sopsFile
+              == null
+              && (
+                lib.any builtins.isString (lib.attrValues svc.secrets.envVars)
+                || lib.any builtins.isString (lib.attrValues svc.secrets.credentials)
+              )) {
+              assertion = false;
+              message = "managedServices.${name}: secrets.sopsFile must be set when using string shorthand in envVars/credentials";
+            }
+            # Each secrets.files entry must have sopsFile coverage
+            ++ lib.concatLists (lib.mapAttrsToList (
+                fileName: spec:
+                  lib.optional (spec.sopsFile == null && svc.secrets.sopsFile == null) {
+                    assertion = false;
+                    message = "managedServices.${name}: secrets.files.${fileName} has no sopsFile (set it on the file or on secrets.sopsFile)";
+                  }
+              )
+              svc.secrets.files)
         )
         enabled);
+
+    # ── Sops secrets integration ─────────────────────────────────
+    sops.secrets = lib.mkIf hasSops (lib.mkMerge (lib.mapAttrsToList (name: svc: let
+      envSecrets =
+        lib.mapAttrs' (_envName: spec: let
+          resolved = resolveSecretSpec spec svc.secrets.sopsFile;
+        in {
+          name = secretAttrName name resolved.key;
+          value = {
+            inherit (resolved) sopsFile key;
+            mode = "0400";
+            owner = lib.mkIf (svc.user != null) svc.user;
+            restartUnits = computeRestartUnits name svc;
+          };
+        })
+        svc.secrets.envVars;
+      credSecrets =
+        lib.mapAttrs' (credName: spec: let
+          resolved = resolveSecretSpec spec svc.secrets.sopsFile;
+        in {
+          name = "${name}-${credName}";
+          value = {
+            inherit (resolved) sopsFile key;
+            mode = "0400";
+            owner = lib.mkIf (svc.user != null) svc.user;
+            restartUnits = computeRestartUnits name svc;
+          };
+        })
+        svc.secrets.credentials;
+      fileSecrets =
+        lib.mapAttrs' (fileName: spec: let
+          effectiveOwner =
+            if spec.owner != null
+            then spec.owner
+            else svc.user;
+        in {
+          name = "${name}-${fileName}";
+          value = {
+            sopsFile =
+              if spec.sopsFile != null
+              then spec.sopsFile
+              else svc.secrets.sopsFile;
+            inherit (spec) key format mode;
+            owner = lib.mkIf (effectiveOwner != null) effectiveOwner;
+            restartUnits = computeRestartUnits name svc;
+          };
+        })
+        svc.secrets.files;
+    in
+      lib.mkIf (hasAnySec svc) (envSecrets // credSecrets // fileSecrets))
+    enabled));
+
+    sops.templates = lib.mkIf hasSops (lib.mkMerge (lib.mapAttrsToList (name: svc:
+      lib.mkIf (svc.secrets.envVars != {}) {
+        "${name}-env" = {
+          content = lib.concatStringsSep "\n" (lib.mapAttrsToList (envName: spec: let
+            resolved = resolveSecretSpec spec svc.secrets.sopsFile;
+          in "${envName}=${outerConfig.sops.placeholder.${secretAttrName name resolved.key}}")
+          svc.secrets.envVars);
+          mode = "0400";
+          owner = lib.mkIf (svc.user != null) svc.user;
+          restartUnits = computeRestartUnits name svc;
+        };
+      })
+    enabled));
 
     # ── Systemd services ──────────────────────────────────────────
     systemd.services = lib.mkMerge (lib.mapAttrsToList (name: svc:
@@ -648,6 +917,26 @@ in {
           # OUTPUT_DIR env injection
           (lib.mkIf (svc.outputDir != null) {
             environment.OUTPUT_DIR = lib.mkDefault svc.outputDir;
+          })
+          # Runtime hint: NODE_ENV=production for Node.js services
+          (lib.mkIf (svc.runtime == "node") {
+            environment.NODE_ENV = lib.mkDefault "production";
+          })
+          # Secrets: EnvironmentFile from sops.templates
+          (lib.mkIf (hasSops && svc.secrets.envVars != {}) {
+            serviceConfig.EnvironmentFile = outerConfig.sops.templates."${name}-env".path;
+          })
+          # Secrets: LoadCredential from sops.secrets
+          (lib.mkIf (hasSops && svc.secrets.credentials != {}) {
+            serviceConfig.LoadCredential = lib.mapAttrsToList (credName: spec: let
+              resolved = resolveSecretSpec spec svc.secrets.sopsFile;
+            in "${credName}:${outerConfig.sops.secrets."${name}-${credName}".path}")
+            svc.secrets.credentials;
+          })
+          # Secrets: auto after/wants sops-nix.service
+          (lib.mkIf (hasSops && hasAnySec svc) {
+            after = ["sops-nix.service"];
+            wants = ["sops-nix.service"];
           })
           # User overrides (merged on top of defaults)
           (builtins.removeAttrs svc.service ["script"])
