@@ -130,19 +130,19 @@ in {
       }
     ];
 
-    # Seed slots from deployment.package on every activation.
-    # The NixOS closure is the source of truth for what version runs.
-    # CI deploys can override the slot for fast iteration, but the
-    # next NixOS deploy resets it to the closure version.
+    # Seed slots from deployment.package when uninitialized or dangling.
+    # After initial seeding, CI owns the slot — NixOS deploys don't touch it.
+    # This avoids downgrading a CI-deployed version to an older flake.lock rev.
+    # Covers: first deploy (no symlink), GC'd store path (dangling symlink).
     system.activationScripts.slotSeed = lib.mkIf (seededSlots != {}) {
       deps = ["specialfs"];
       text = lib.concatStringsSep "\n" (lib.mapAttrsToList (name: svc: let
           slotDir = "${cfg.baseDir}/${name}";
+          binPath = "${slotDir}/current/bin/${svc.deployment.binName}";
           pkg = svc.deployment.package;
         in ''
-          current=$(readlink "${slotDir}/current" 2>/dev/null || true)
-          if [ "$current" != "${pkg}" ]; then
-            echo "slot-seed: setting ${name} to closure package"
+          if [ ! -x "${binPath}" ]; then
+            echo "slot-seed: initializing ${name} from closure package"
             ln -sfn "${pkg}" "${slotDir}/current.tmp"
             mv -fT "${slotDir}/current.tmp" "${slotDir}/current"
           fi
