@@ -834,6 +834,10 @@ in {
             {
               wantedBy = lib.mkDefault ["multi-user.target"];
               after = lib.mkDefault ["network.target"];
+              # Slot services: binary lifecycle managed by CI, not nixos-rebuild.
+              # Prevent deploy-rs from restarting on config change — CI triggers
+              # handle restarts after slot updates. Seed provides the initial binary.
+              restartIfChanged = lib.mkIf svc.deployment.slot.enable (lib.mkDefault false);
               serviceConfig = lib.mapAttrs (_: lib.mkDefault) (
                 {
                   Type = "simple";
