@@ -72,22 +72,20 @@ in {
       '';
     };
 
-    # Read-only connection info for service modules
+    # Connection info for service modules (auto-derived from broker, or set manually for remote brokers)
     host = lib.mkOption {
       type = lib.types.str;
       default =
         if brokerCfg.address == "0.0.0.0" || brokerCfg.address == "::"
         then "localhost"
         else brokerCfg.address;
-      readOnly = true;
-      description = "MQTT broker hostname for service modules to connect to. Auto-derived from broker.address (wildcard addresses resolve to localhost).";
+      description = "MQTT broker hostname for service modules to connect to. Auto-derived from broker.address when using local broker. Set manually for remote brokers.";
     };
 
     port = lib.mkOption {
       type = lib.types.port;
       default = brokerCfg.port;
-      readOnly = true;
-      description = "MQTT broker port (for service modules to reference).";
+      description = "MQTT broker port (for service modules to reference). Auto-derived from broker.port when using local broker.";
     };
   };
 
