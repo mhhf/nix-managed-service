@@ -30,6 +30,14 @@
 
   slotNames = lib.attrNames slotServices;
 
+  # Slot services with a seed package (for initial population)
+  seededSlots =
+    lib.filterAttrs (
+      _: svc:
+        svc.deployment.package != null
+    )
+    slotServices;
+
   # Collect restart units: each slot-enabled service contributes its restartUnit
   restartUnits =
     lib.mapAttrsToList (
@@ -121,6 +129,25 @@ in {
           restartUnits;
       }
     ];
+
+    # Seed slots from deployment.package when binary is missing
+    # This ensures first deploy works (before CI has run) and provides
+    # a known-good fallback if a CI-deployed binary is broken/missing.
+    system.activationScripts.slotSeed = lib.mkIf (seededSlots != {}) {
+      deps = ["specialfs"];
+      text = lib.concatStringsSep "\n" (lib.mapAttrsToList (name: svc: let
+          slotDir = "${cfg.baseDir}/${name}";
+          binPath = "${slotDir}/current/bin/${svc.deployment.binName}";
+          pkg = svc.deployment.package;
+        in ''
+          if [ ! -x "${binPath}" ]; then
+            echo "slot-seed: populating ${name} from nix closure"
+            ln -sfn "${pkg}" "${slotDir}/current.tmp"
+            mv -fT "${slotDir}/current.tmp" "${slotDir}/current"
+          fi
+        '')
+        seededSlots);
+    };
 
     # Extra packages
     environment.systemPackages = cfg.extraPackages;
