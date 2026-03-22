@@ -211,6 +211,13 @@ To trigger on a different branch:
 on.ci = { repo = "calc"; branch = "develop"; };
 ```
 
+Use `"*"` to match any branch, or `"prefix/*"` for a prefix match:
+
+```nix
+on.ci = { repo = "calc"; branch = "*"; };           # any branch
+on.ci = { repo = "calc"; branch = "feature/*"; };   # any feature/ branch
+```
+
 #### Trigger on schedule
 
 Run a job on a systemd calendar schedule:
@@ -308,6 +315,65 @@ managedServices.light-sync = {
 };
 ```
 
+For complex payload matching, use `jqFilter` instead of `filter` (mutually exclusive):
+
+```nix
+managedServices.temp-alert = {
+  on.mqtt = {
+    topic = "sensors/temperature";
+    jqFilter = ".value > 30 and .unit == \"C\"";  # raw jq expression
+  };
+  service.script = "...";
+};
+```
+
+The same `jqFilter` escape hatch is available on `deployment.on.mqtt.jqFilter`.
+
+#### MQTT status publishing
+
+To publish job status to MQTT on start and completion:
+
+```nix
+managedServices.calc-benchmark = {
+  on.ci = "calc";
+  on.publishStatus = true;  # publishes to "jobs/calc-benchmark/status"
+  service.script = "...";
+};
+```
+
+Published messages:
+- On start (ExecStartPre): `{"status":"started","timestamp":"..."}`
+- On stop (ExecStopPost, always runs): `{"status":"$SERVICE_RESULT","exitCode":"$EXIT_CODE","timestamp":"..."}`
+
+The `trigger-mqtt` user is automatically granted `readwrite jobs/#` ACL when any service uses `publishStatus`.
+
+#### Overlap policies
+
+Control what happens when a trigger fires while the service is already running:
+
+```nix
+managedServices.my-job = {
+  on.ci = "myrepo";
+  overlap = "skip";    # default: ignore new trigger if already running
+  # overlap = "cancel"; # stop current run and start fresh
+  service.script = "...";
+};
+```
+
+#### Rate limiting
+
+Throttle rapid-fire triggers:
+
+```nix
+managedServices.my-job = {
+  on.mqtt = { topic = "sensors/update"; };
+  triggerRateLimit = { interval = "5m"; };  # at most once per 5 minutes
+  service.script = "...";
+};
+```
+
+Interval units: `s` (seconds), `m` (minutes), `h` (hours), or combinations like `"2h30m"`.
+
 #### Auto-deploy on trigger
 
 For services with deployment slots, trigger automatic builds and deploys:
@@ -327,6 +393,46 @@ managedServices.os-web = {
 ```
 
 The framework generates an `os-web-deploy.service` oneshot that: builds the flake expression, rsyncs to the slot directory, restarts the service. Deploy services automatically serialize via `flock` (using `concurrencyGroup` if set, otherwise a shared `deploys` lock).
+
+#### Pre/post deploy hooks
+
+Run custom scripts before or after the slot swap:
+
+```nix
+managedServices.os-web = {
+  deployment = {
+    slot.enable = true;
+    source = "/var/lib/src/os-web";
+    preDeploy = "echo 'starting deploy at $(date)'";
+    postDeploy = "curl -s https://os.example.com/api/reload || true";
+    on.ci = "os-web";
+  };
+  service = {};
+};
+```
+
+`preDeploy` runs after acquiring the deploy lock, before the build. `postDeploy` runs after the service restart.
+
+#### Post-deploy health check with rollback
+
+Automatically roll back if the service doesn't pass a health check after deploy:
+
+```nix
+managedServices.os-web = {
+  deployment = {
+    slot.enable = true;
+    source = "/var/lib/src/os-web";
+    on.ci = "os-web";
+    healthCheck = {
+      url = "https://os.example.com/api/health";
+      timeout = 30;  # seconds to wait before rollback
+    };
+  };
+  service = {};
+};
+```
+
+The deploy script saves the previous slot symlink, swaps in the new build, restarts the service, and then polls the URL. If it doesn't return 2xx within `timeout` seconds, the old slot is restored and the service is restarted with the previous version.
 
 #### Combining triggers
 
@@ -348,13 +454,22 @@ managedServices.calc-benchmark = {
 | You declare | Framework generates |
 |---|---|
 | `on.ci` | MQTT subscription + dispatch rule in `trigger-mqtt.service`, ACL for `trigger-mqtt` user |
+| `on.ci.branch = "*"` | Dispatch without branch filter (any branch) |
+| `on.ci.branch = "prefix/*"` | Dispatch with jq `startswith` filter |
 | `on.schedule` | `trigger-<name>.timer` + `trigger-<name>.service` launcher |
 | `on.schedule.ifNewCommits` | `ExecCondition` guard + SHA tracking in `ExecStartPost` |
 | `on.mqtt` | Same as `on.ci` but with custom topic/filter |
-| `concurrencyGroup` | `ExecStartPre` flock on `/run/lock/trigger-group-<group>.lock` |
+| `on.mqtt.jqFilter` | Raw jq expression used instead of generated filter |
+| `on.publishStatus = true` | `ExecStartPre` (started) + `ExecStopPost` (result) publishing to `jobs/<name>/status` |
+| `overlap = "cancel"` | `systemctl restart` instead of start-if-not-active in dispatch |
+| `triggerRateLimit` | Timestamp file check in dispatch to enforce minimum interval |
+| `concurrencyGroup` | `ExecStartPre` flock on `/run/trigger-locks/<group>.lock` |
 | `outputDir` | Directory via tmpfiles, `$OUTPUT_DIR` env var, `ReadWritePaths` |
 | `outputCommit` | `ExecStartPost` git add + commit |
-| `deployment.on.*` | `<name>-deploy.service` oneshot (build + rsync + restart) |
+| `deployment.on.*` | `<name>-deploy.service` oneshot (build + slot swap + restart) |
+| `deployment.preDeploy` | `ExecStartPre` in deploy service (after flock) |
+| `deployment.postDeploy` | `ExecStartPost` in deploy service |
+| `deployment.healthCheck` | Post-restart poll loop with rollback on timeout |
 
 ### Container services
 
@@ -491,15 +606,21 @@ jellyfin (8096), grafana (3000), prometheus (9090), alertmanager (9093), transmi
 | `healthCheck.interval` | str | `"60s"` | Check interval |
 | `healthCheck.timeoutSec` | int | `10` | Timeout in seconds |
 | `healthCheck.onFailure` | enum | `"notify"` | `"restart"` or `"notify"` |
-| `on.ci` | nullOr (str or {repo, branch}) | `null` | CI trigger — string is repo name shorthand |
+| `on.ci` | nullOr (str or {repo, branch}) | `null` | CI trigger — string is repo name shorthand; branch supports `"*"` and `"prefix/*"` wildcards |
 | `on.schedule` | nullOr (str or {calendar, ifNewCommits}) | `null` | Schedule trigger — string is calendar shorthand |
-| `on.mqtt` | nullOr {topic, filter} | `null` | Raw MQTT trigger |
+| `on.mqtt` | nullOr {topic, filter, jqFilter} | `null` | Raw MQTT trigger; use `jqFilter` for raw jq expressions (mutually exclusive with `filter`) |
+| `on.publishStatus` | bool | `false` | Publish MQTT status to `jobs/<name>/status` on start and completion |
+| `overlap` | enum | `"skip"` | `"skip"` (ignore if running) or `"cancel"` (restart) |
+| `triggerRateLimit` | nullOr {interval} | `null` | Minimum interval between triggers (e.g. `"5m"`, `"1h"`) |
 | `concurrencyGroup` | nullOr str | `null` | Serialize via flock with other services in same group |
 | `outputDir` | nullOr str | `null` | Output directory (auto-created, `$OUTPUT_DIR` env) |
 | `outputCommit` | nullOr (str or {message, repo, paths}) | `null` | Auto-commit after success |
 | `deployment.on.ci` | nullOr (str or {repo, branch}) | `null` | CI trigger for auto-deploy |
 | `deployment.on.schedule` | nullOr str | `null` | Schedule trigger for auto-deploy |
-| `deployment.on.mqtt` | nullOr {topic, filter} | `null` | MQTT trigger for auto-deploy |
+| `deployment.on.mqtt` | nullOr {topic, filter, jqFilter} | `null` | MQTT trigger for auto-deploy |
+| `deployment.preDeploy` | nullOr str | `null` | Shell script to run before build + slot swap |
+| `deployment.postDeploy` | nullOr str | `null` | Shell script to run after service restart |
+| `deployment.healthCheck` | nullOr {url, timeout} | `null` | Post-deploy health check URL; rolls back on failure |
 | `deployment.source` | nullOr str | `null` | Source directory for auto-deploy builds |
 | `deployment.buildExpr` | str | `".#default"` | Nix build expression for auto-deploy |
 | `mqtt.user` | str | — | MQTT username |

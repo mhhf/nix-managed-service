@@ -36,13 +36,39 @@
         branch = "main";
       }
       else ci;
-  in {
-    topic = "git/ci/${parsed.repo}";
-    filter = {
-      status = "PASS";
-      inherit (parsed) branch;
-    };
-  };
+    # Branch wildcard support:
+    #   "*"        → no branch filter (match any)
+    #   "prefix/*" → jq startswith filter
+    #   "main"     → exact match filter
+    branchFilter =
+      if parsed.branch == "*"
+      then {} # no branch condition
+      else {branch = parsed.branch;}; # exact match (or prefix/* handled in jqFilter)
+    branchJqFilter = let
+      b = parsed.branch;
+    in
+      if b == "*"
+      then null
+      else if lib.hasSuffix "/*" b
+      then let
+        prefix = lib.removeSuffix "/*" b;
+      in ".status == \"PASS\" and (.branch | startswith(\"${prefix}/\"))"
+      else null;
+  in
+    {
+      topic = "git/ci/${parsed.repo}";
+    }
+    // (
+      if branchJqFilter != null
+      then {
+        jqFilter = branchJqFilter;
+        filter = {};
+      }
+      else {
+        filter = {status = "PASS";} // branchFilter;
+        jqFilter = null;
+      }
+    );
 
   normalizeSchedule = sched:
     if builtins.isString sched
@@ -85,11 +111,27 @@
   # ── MQTT trigger collection ───────────────────────────────────
   collectMqttForSvc = name: svc: let
     jobMqtt =
-      lib.optional (svc.on.ci != null) ((normalizeCi svc.on.ci) // {unit = svc.serviceName;})
-      ++ lib.optional (svc.on.mqtt != null) (svc.on.mqtt // {unit = svc.serviceName;});
+      lib.optional (svc.on.ci != null) ((normalizeCi svc.on.ci)
+        // {
+          unit = svc.serviceName;
+          svcName = name;
+        })
+      ++ lib.optional (svc.on.mqtt != null) (svc.on.mqtt
+        // {
+          unit = svc.serviceName;
+          svcName = name;
+        });
     deployMqtt =
-      lib.optional (svc.deployment.on.ci != null) ((normalizeCi svc.deployment.on.ci) // {unit = "${name}-deploy";})
-      ++ lib.optional (svc.deployment.on.mqtt != null) (svc.deployment.on.mqtt // {unit = "${name}-deploy";});
+      lib.optional (svc.deployment.on.ci != null) ((normalizeCi svc.deployment.on.ci)
+        // {
+          unit = "${name}-deploy";
+          svcName = name;
+        })
+      ++ lib.optional (svc.deployment.on.mqtt != null) (svc.deployment.on.mqtt
+        // {
+          unit = "${name}-deploy";
+          svcName = name;
+        });
   in
     jobMqtt ++ deployMqtt;
 
@@ -116,28 +158,99 @@
     allTriggered);
 
   # ── JQ filter generation ──────────────────────────────────────
-  filterToJqExpr = filter: let
+  # mqttEntry has {topic, filter, jqFilter (optional), unit, ...}
+  # If jqFilter is set (non-null), use it directly; otherwise generate from filter.
+  filterToJqExpr = mqttEntry: let
+    filter = mqttEntry.filter or {};
+    jqFilter = mqttEntry.jqFilter or null;
     conditions = lib.mapAttrsToList (k: v: ".${k} == \"${v}\"") filter;
+    generated =
+      if conditions == []
+      then "true"
+      else lib.concatStringsSep " and " conditions;
   in
-    if conditions == []
-    then "true"
-    else lib.concatStringsSep " and " conditions;
+    if jqFilter != null
+    then jqFilter
+    else generated;
+
+  # ── Helper: shell function for interval-to-seconds parsing ──────
+  # Emits a _parse_interval() shell function that converts strings like
+  # "1h", "30m", "90s", "2h30m" to seconds. Injected once into the
+  # dispatch script when any service has triggerRateLimit set.
+  hasAnyRateLimit = lib.any (svc: svc.triggerRateLimit != null) (lib.attrValues allTriggered);
+
+  parseIntervalShellFn = ''
+    _parse_interval() {
+      local s="$1" total=0 n unit
+      # handle NhMm style by splitting on letters
+      while [ -n "$s" ]; do
+        n="''${s%%[!0-9]*}"
+        s="''${s#"$n"}"
+        unit="''${s%%[0-9]*}"
+        s="''${s#"$unit"}"
+        case "$unit" in
+          h) total=$((total + n * 3600)) ;;
+          m) total=$((total + n * 60)) ;;
+          s) total=$((total + n)) ;;
+          *) total=$((total + n)) ;;
+        esac
+      done
+      echo "$total"
+    }
+  '';
+
+  # Build per-trigger rate-limit check snippet
+  mkRateLimitCheck = t: let
+    svc = cfg.${t.svcName};
+    rl = svc.triggerRateLimit;
+  in
+    if rl == null
+    then ""
+    else ''
+      rate_file="/run/trigger-locks/${t.unit}.last-trigger"
+      if [ -f "$rate_file" ]; then
+        _last=$(cat "$rate_file" 2>/dev/null || echo 0)
+        _now=$(date +%s)
+        _interval=$(_parse_interval "${rl.interval}")
+        if [ $((_now - _last)) -lt "$_interval" ]; then
+          echo "$(date -Iseconds) rate-limited ${t.unit} (interval: ${rl.interval})" >&2
+          continue
+        fi
+      fi
+      date +%s > "$rate_file"
+    '';
+
+  # Build per-trigger overlap check + start snippet
+  mkOverlapDispatch = t: let
+    svc = cfg.${t.svcName};
+    overlap = svc.overlap;
+  in
+    if overlap == "cancel"
+    then ''
+      /run/current-system/sw/bin/systemctl restart ${t.unit}.service &
+      echo "$(date -Iseconds) triggered ${t.unit} via ${t.topic} (cancel+restart)" >&2
+    ''
+    else ''
+      if ! /run/current-system/sw/bin/systemctl is-active --quiet ${t.unit}.service 2>/dev/null; then
+        /run/current-system/sw/bin/systemctl start ${t.unit}.service &
+        echo "$(date -Iseconds) triggered ${t.unit} via ${t.topic}" >&2
+      else
+        echo "$(date -Iseconds) skipped ${t.unit} (already active)" >&2
+      fi
+    '';
 
   # ── Script generators ─────────────────────────────────────────
   mqttDispatchScript = pkgs.writeShellScript "trigger-mqtt-dispatch" ''
     set -uo pipefail
+    ${lib.optionalString hasAnyRateLimit parseIntervalShellFn}
     while IFS= read -r line; do
       topic="$(printf '%s' "$line" | ${pkgs.jq}/bin/jq -r '.topic')"
       payload="$(printf '%s' "$line" | ${pkgs.jq}/bin/jq '.payload')"
       ${lib.concatMapStrings (t: ''
         if [ "$topic" = "${t.topic}" ]; then
-          if printf '%s' "$payload" | ${pkgs.jq}/bin/jq -e '${filterToJqExpr t.filter}' >/dev/null 2>&1; then
-            if ! /run/current-system/sw/bin/systemctl is-active --quiet ${t.unit}.service 2>/dev/null; then
-              /run/current-system/sw/bin/systemctl start ${t.unit}.service &
-              echo "$(date -Iseconds) triggered ${t.unit} via ${t.topic}" >&2
-            else
-              echo "$(date -Iseconds) skipped ${t.unit} (already active)" >&2
-            fi
+          if printf '%s' "$payload" | ${pkgs.jq}/bin/jq -e '${filterToJqExpr t}' >/dev/null 2>&1; then
+            ${mkRateLimitCheck t}
+            ${mkOverlapDispatch t}
           fi
         fi
       '')
@@ -178,6 +291,44 @@
         ${pkgs.git}/bin/git -C "$repo" commit -m ${lib.escapeShellArg commitCfg.message}
     '';
 
+  # ── publishStatus helpers ─────────────────────────────────────
+  # Returns ExecStartPre and ExecStopPost entries for status publishing.
+  # mqttPubCmd builds a one-shot mosquitto_pub invocation.
+  mqttPubCmd = topic: message: let
+    host =
+      if config ? mqtt && config.mqtt ? host
+      then config.mqtt.host
+      else "localhost";
+    port =
+      if config ? mqtt && config.mqtt ? port
+      then toString config.mqtt.port
+      else "1883";
+    hasPassword =
+      config ? mqtt
+      && config.mqtt ? users
+      && config.mqtt.users ? trigger-mqtt
+      && config.mqtt.users.trigger-mqtt ? passwordFile
+      && config.mqtt.users.trigger-mqtt.passwordFile != null;
+    passwordFile =
+      if hasPassword
+      then config.mqtt.users.trigger-mqtt.passwordFile
+      else null;
+  in (
+    if passwordFile != null
+    then "${pkgs.mosquitto}/bin/mosquitto_pub -h ${host} -p ${port} -u trigger-mqtt -P \"$(cat ${lib.escapeShellArg passwordFile})\" -t ${lib.escapeShellArg topic} -m ${lib.escapeShellArg message}"
+    else "${pkgs.mosquitto}/bin/mosquitto_pub -h ${host} -p ${port} -u trigger-mqtt -t ${lib.escapeShellArg topic} -m ${lib.escapeShellArg message}"
+  );
+
+  mkPublishStatusExecStartPre = name:
+    pkgs.writeShellScript "publish-status-start-${name}" ''
+      ${mqttPubCmd "jobs/${name}/status" ''{"status":"started","timestamp":"$(date -Iseconds)"}''} || true
+    '';
+
+  mkPublishStatusExecStopPost = name:
+    pkgs.writeShellScript "publish-status-stop-${name}" ''
+      ${mqttPubCmd "jobs/${name}/status" ''{"status":"$SERVICE_RESULT","exitCode":"$EXIT_CODE","timestamp":"$(date -Iseconds)"}''} || true
+    '';
+
   mkDeployScript = name: svc:
     pkgs.writeShellScript "trigger-deploy-${name}" ''
       set -euo pipefail
@@ -186,12 +337,53 @@
       # but ~/.gitconfig is respected.
       ${pkgs.git}/bin/git config --global safe.directory '*'
       cd ${lib.escapeShellArg svc.deployment.source}
+      ${lib.optionalString (svc.deployment.preDeploy != null) ''
+        # Pre-deploy hook
+        ${svc.deployment.preDeploy}
+      ''}
       result=$(/run/current-system/sw/bin/nix build ${lib.escapeShellArg svc.deployment.buildExpr} \
         --no-link --print-out-paths | tail -1)
+      ${lib.optionalString (svc.deployment.healthCheck != null) ''
+        # Save previous slot for rollback
+        _prev_slot=""
+        if [ -L ${lib.escapeShellArg svc.deployment.slotPath} ]; then
+          _prev_slot="$(readlink ${lib.escapeShellArg svc.deployment.slotPath})"
+        fi
+      ''}
       # Atomic symlink swap (same mechanism as auto-deploy)
       ln -sfn "$result" ${lib.escapeShellArg "${svc.deployment.slotPath}.tmp"}
       mv -fT ${lib.escapeShellArg "${svc.deployment.slotPath}.tmp"} ${lib.escapeShellArg svc.deployment.slotPath}
       /run/wrappers/bin/sudo /run/current-system/sw/bin/systemctl restart ${svc.deployment.slot.restartUnit}
+      ${lib.optionalString (svc.deployment.healthCheck != null) (let
+        hc = svc.deployment.healthCheck;
+      in ''
+        # Post-deploy health check with rollback
+        _hc_passed=0
+        for _i in $(seq 1 ${toString hc.timeout}); do
+          if ${pkgs.curl}/bin/curl -sf ${lib.escapeShellArg hc.url} >/dev/null 2>&1; then
+            echo "$(date -Iseconds) health check passed for ${name}" >&2
+            _hc_passed=1
+            break
+          fi
+          sleep 1
+        done
+        if [ "$_hc_passed" -eq 0 ]; then
+          echo "$(date -Iseconds) health check failed for ${name}, rolling back" >&2
+          if [ -n "$_prev_slot" ]; then
+            ln -sfn "$_prev_slot" ${lib.escapeShellArg "${svc.deployment.slotPath}.tmp"}
+            mv -fT ${lib.escapeShellArg "${svc.deployment.slotPath}.tmp"} ${lib.escapeShellArg svc.deployment.slotPath}
+            /run/wrappers/bin/sudo /run/current-system/sw/bin/systemctl restart ${svc.deployment.slot.restartUnit}
+            echo "$(date -Iseconds) rollback complete for ${name}" >&2
+          else
+            echo "$(date -Iseconds) no previous slot to roll back to for ${name}" >&2
+          fi
+          exit 1
+        fi
+      '')}
+      ${lib.optionalString (svc.deployment.postDeploy != null) ''
+        # Post-deploy hook
+        ${svc.deployment.postDeploy}
+      ''}
     '';
 in {
   # Fixed-structure config — dynamic computation happens inside each option path,
@@ -306,6 +498,15 @@ in {
           ${svc.serviceName}.serviceConfig.ExecStartPost = [(mkOutputCommitScript name svc)];
         })
       allTriggered)
+      # publishStatus: job services — ExecStartPre publishes "started", ExecStopPost publishes result
+      ++ (lib.mapAttrsToList (name: svc:
+        lib.mkIf (svc.on.publishStatus && svc.service != null) {
+          ${svc.serviceName}.serviceConfig = {
+            ExecStartPre = ["-${mkPublishStatusExecStartPre name}"];
+            ExecStopPost = ["-${mkPublishStatusExecStopPost name}"];
+          };
+        })
+      jobTriggered)
       # Deploy oneshot services
       ++ (lib.mapAttrsToList (name: svc: {
           "${name}-deploy" = {
@@ -321,9 +522,14 @@ in {
                 else "root";
               ExecStart = mkDeployScript name svc;
               ExecStartPre =
-                if svc.concurrencyGroup != null
-                then ["${pkgs.util-linux}/bin/flock /run/trigger-locks/${svc.concurrencyGroup}.lock true"]
-                else ["${pkgs.util-linux}/bin/flock /run/trigger-locks/deploys.lock true"];
+                (
+                  if svc.concurrencyGroup != null
+                  then ["${pkgs.util-linux}/bin/flock /run/trigger-locks/${svc.concurrencyGroup}.lock true"]
+                  else ["${pkgs.util-linux}/bin/flock /run/trigger-locks/deploys.lock true"]
+                )
+                ++ lib.optional svc.on.publishStatus "-${mkPublishStatusExecStartPre "${name}-deploy"}";
+              ExecStopPost =
+                lib.optional svc.on.publishStatus "-${mkPublishStatusExecStopPost "${name}-deploy"}";
             };
           };
         })
@@ -364,7 +570,11 @@ in {
 
     # ── MQTT ACL for trigger-mqtt user ──────────────────────────
     mqtt.users = lib.mkIf (allMqttTriggers != [] && config ? mqtt && config.mqtt ? users) {
-      trigger-mqtt.acl = map (topic: "read ${topic}") uniqueTopics;
+      trigger-mqtt.acl =
+        map (topic: "read ${topic}") uniqueTopics
+        # Allow publishing status when any triggered service has publishStatus = true
+        ++ lib.optional (lib.any (svc: svc.on.publishStatus) (lib.attrValues allTriggered))
+        "readwrite jobs/#";
     };
   };
 }

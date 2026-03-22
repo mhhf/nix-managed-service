@@ -211,11 +211,59 @@
                   type = lib.types.attrsOf lib.types.str;
                   default = {};
                 };
+                jqFilter = lib.mkOption {
+                  type = lib.types.nullOr lib.types.str;
+                  default = null;
+                  description = ''
+                    Raw jq expression for payload filtering. When set, overrides filter.
+                    Mutually exclusive with filter.
+                  '';
+                };
               };
             });
             default = null;
             description = "Raw MQTT deploy trigger (escape hatch).";
           };
+        };
+
+        preDeploy = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = ''
+            Shell script to run before the build + slot swap.
+            Runs as ExecStartPre (after the flock, before the build).
+          '';
+        };
+
+        postDeploy = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = ''
+            Shell script to run after service restart following deploy.
+            Runs as ExecStartPost.
+          '';
+        };
+
+        healthCheck = lib.mkOption {
+          type = lib.types.nullOr (lib.types.submodule {
+            options = {
+              url = lib.mkOption {
+                type = lib.types.str;
+                description = "HTTP URL to check after deploy (curl -sf).";
+              };
+              timeout = lib.mkOption {
+                type = lib.types.int;
+                default = 30;
+                description = "Seconds to wait for the health check to pass before rolling back.";
+              };
+            };
+          });
+          default = null;
+          description = ''
+            Post-deploy health check. When set, the deploy script polls the URL
+            for up to timeout seconds after the service restart. If the check
+            fails, it rolls back to the previous slot and restarts the service.
+          '';
         };
 
         source = lib.mkOption {
@@ -391,6 +439,9 @@
               branch = lib.mkOption {
                 type = lib.types.str;
                 default = "main";
+                description = ''
+                  Branch to match. Use "*" for any branch, or "prefix/*" for prefix match.
+                '';
               };
             };
           }));
@@ -400,6 +451,9 @@
               on.ci = "calc"  →  topic git/ci/calc, filter {status=PASS, branch=main}
             Attrset for custom branch:
               on.ci = { repo = "calc"; branch = "develop"; }
+            Wildcard:
+              on.ci = { repo = "calc"; branch = "*"; }  →  any branch
+              on.ci = { repo = "calc"; branch = "feature/*"; }  →  prefix match
           '';
         };
 
@@ -434,11 +488,61 @@
                 type = lib.types.attrsOf lib.types.str;
                 default = {};
               };
+              jqFilter = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = ''
+                  Raw jq expression for payload filtering. When set, overrides filter.
+                  Mutually exclusive with filter.
+                  Example: ".temperature > 20 and .unit == \"C\""
+                '';
+              };
             };
           });
           default = null;
           description = "Raw MQTT trigger for topics outside git/ci/*.";
         };
+
+        publishStatus = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            Publish MQTT status messages for this job service.
+            When true, publishes to "jobs/<name>/status" on start (ExecStartPre)
+            and completion (ExecStopPost), including exit code and service result.
+            Requires the trigger-mqtt MQTT user to be configured.
+          '';
+        };
+      };
+
+      overlap = lib.mkOption {
+        type = lib.types.enum ["skip" "cancel"];
+        default = "skip";
+        description = ''
+          Policy when an MQTT trigger fires while the service is already running:
+          - "skip": ignore the trigger (default behavior)
+          - "cancel": stop the current run and start a new one (systemctl restart)
+        '';
+      };
+
+      triggerRateLimit = lib.mkOption {
+        type = lib.types.nullOr (lib.types.submodule {
+          options = {
+            interval = lib.mkOption {
+              type = lib.types.str;
+              description = ''
+                Minimum time between triggers. Parsed as seconds or with suffix:
+                "30s", "5m", "1h", "2h30m".
+              '';
+              example = "1h";
+            };
+          };
+        });
+        default = null;
+        description = ''
+          Rate limit MQTT triggers. When set, the dispatch script checks a
+          timestamp file and skips the trigger if fired within the interval.
+        '';
       };
 
       concurrencyGroup = lib.mkOption {
@@ -803,6 +907,21 @@ in {
               ++ lib.optional ((svc.deployment.on.ci != null || svc.deployment.on.schedule != null || svc.deployment.on.mqtt != null) && !svc.deployment.slot.enable) {
                 assertion = false;
                 message = "managedServices.${name}: deployment.on.* triggers require deployment.slot.enable = true";
+              }
+              # on.mqtt: jqFilter and filter are mutually exclusive
+              ++ lib.optional (svc.on.mqtt != null && svc.on.mqtt.jqFilter != null && svc.on.mqtt.filter != {}) {
+                assertion = false;
+                message = "managedServices.${name}: on.mqtt.jqFilter and on.mqtt.filter are mutually exclusive — use only one";
+              }
+              # deployment.on.mqtt: jqFilter and filter are mutually exclusive
+              ++ lib.optional (svc.deployment.on.mqtt != null && svc.deployment.on.mqtt.jqFilter != null && svc.deployment.on.mqtt.filter != {}) {
+                assertion = false;
+                message = "managedServices.${name}: deployment.on.mqtt.jqFilter and deployment.on.mqtt.filter are mutually exclusive — use only one";
+              }
+              # deployment.healthCheck requires deployment.source (for rollback)
+              ++ lib.optional (svc.deployment.healthCheck != null && svc.deployment.source == null) {
+                assertion = false;
+                message = "managedServices.${name}: deployment.healthCheck requires deployment.source to be set";
               }
               # secrets.sopsFile required when string shorthand is used in envVars/credentials
               ++ lib.optional (svc.secrets.sopsFile
