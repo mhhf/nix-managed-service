@@ -794,6 +794,11 @@ in {
           default = name;
           description = "Group for workspace access. Defaults to workspace name.";
         };
+        gid = lib.mkOption {
+          type = lib.types.nullOr lib.types.int;
+          default = null;
+          description = "Fixed GID for the workspace group. Required for container bridging.";
+        };
         extraMembers = lib.mkOption {
           type = lib.types.listOf lib.types.str;
           default = [];
@@ -898,7 +903,7 @@ in {
         enabled)
         # Workspace groups
         ++ (lib.mapAttrsToList (_: ws: {
-            ${ws.group} = {};
+            ${ws.group} = lib.optionalAttrs (ws.gid != null) {inherit (ws) gid;};
           })
           wsCfg)
       );
