@@ -25,6 +25,7 @@
       extractDnsRecords = import ./lib/dns.nix;
       mkDnsPushApp = import ./lib/push-app.nix;
       extractServiceRegistry = import ./lib/registry.nix;
+      extractZoneRegistry = import ./lib/zones.nix;
     };
 
     # Formatting

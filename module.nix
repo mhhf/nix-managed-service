@@ -749,6 +749,17 @@
         default = {};
         description = "Additional directories to create via tmpfiles (beyond stateDir).";
       };
+
+      # ── Workspace access ───────────────────────────────────────────
+      access = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [];
+        description = ''
+          List of workspace names this service participates in.
+          The service's user is added to each workspace's group.
+          Each name must correspond to a workspaces.<name> declaration.
+        '';
+      };
     };
   });
 in {
@@ -762,6 +773,41 @@ in {
     '';
   };
 
+  options.workspaces = lib.mkOption {
+    type = lib.types.attrsOf (lib.types.submodule ({name, ...}: {
+      options = {
+        path = lib.mkOption {
+          type = lib.types.str;
+          description = "Filesystem path for this workspace.";
+        };
+        description = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Human-readable description of this workspace.";
+        };
+        owner = lib.mkOption {
+          type = lib.types.str;
+          description = "Primary user that owns the workspace directory.";
+        };
+        group = lib.mkOption {
+          type = lib.types.str;
+          default = name;
+          description = "Group for workspace access. Defaults to workspace name.";
+        };
+        extraMembers = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [];
+          description = "Non-managed-service users that need workspace group access.";
+        };
+      };
+    }));
+    default = {};
+    description = ''
+      Shared workspace declarations. Each workspace creates a group with setgid
+      directory. Managed services join workspaces via access = ["name"].
+    '';
+  };
+
   # Config uses a fixed-structure attrset so the module system can extract
   # definitions from static keys without forcing config.managedServices.
   # Values are lazy thunks — only evaluated when specific options are accessed,
@@ -769,6 +815,7 @@ in {
   config = let
     cfg = config.managedServices;
     enabled = lib.filterAttrs (_: svc: svc.enable) cfg;
+    wsCfg = config.workspaces;
 
     hasMqtt = options ? mqtt && options.mqtt ? users;
 
@@ -820,45 +867,71 @@ in {
       enabled;
 
       # ── Users and groups ──────────────────────────────────────────
-      users.users = lib.mkMerge (lib.mapAttrsToList (_: svc:
-        lib.mkIf (svc.user != null) {
-          ${svc.user} = {
-            isSystemUser = true;
-            group = svc.group;
-            home = lib.mkIf (svc.stateDir != null) svc.stateDir;
-            createHome = lib.mkIf (svc.stateDir != null) true;
-          };
-        })
-      enabled);
+      users.users = lib.mkMerge (
+        # Service users
+        (lib.mapAttrsToList (_: svc:
+          lib.mkIf (svc.user != null) {
+            ${svc.user} = {
+              isSystemUser = true;
+              group = svc.group;
+              home = lib.mkIf (svc.stateDir != null) svc.stateDir;
+              createHome = lib.mkIf (svc.stateDir != null) true;
+              extraGroups = lib.mkIf (svc.access != []) svc.access;
+            };
+          })
+        enabled)
+        # Workspace extraMembers
+        ++ (lib.mapAttrsToList (_: ws:
+          lib.mkMerge (map (member: {
+              ${member}.extraGroups = [ws.group];
+            })
+            ws.extraMembers))
+        wsCfg)
+      );
 
-      users.groups = lib.mkMerge (lib.mapAttrsToList (_: svc:
-        lib.mkIf (svc.user != null) {
-          ${svc.group} = {};
-        })
-      enabled);
+      users.groups = lib.mkMerge (
+        # Service groups
+        (lib.mapAttrsToList (_: svc:
+          lib.mkIf (svc.user != null) {
+            ${svc.group} = {};
+          })
+        enabled)
+        # Workspace groups
+        ++ (lib.mapAttrsToList (_: ws: {
+            ${ws.group} = {};
+          })
+          wsCfg)
+      );
 
       # ── State directories + output directories ─────────────────────
-      systemd.tmpfiles.rules = lib.concatLists (lib.mapAttrsToList (_: svc:
-        lib.optional (svc.stateDir != null && svc.user != null)
-        "d ${svc.stateDir} 0750 ${svc.user} ${svc.group} -"
-        ++ lib.optional (svc.outputDir != null && svc.user != null)
-        "d ${svc.outputDir} 0750 ${svc.user} ${svc.group} -"
-        ++ lib.mapAttrsToList (_: dir: let
-          u =
-            if dir.user != null
-            then dir.user
-            else if svc.user != null
-            then svc.user
-            else "root";
-          g =
-            if dir.group != null
-            then dir.group
-            else if svc.group != null
-            then svc.group
-            else "root";
-        in "d ${dir.path} ${dir.mode} ${u} ${g} -")
-        svc.extraDirs)
-      enabled);
+      systemd.tmpfiles.rules =
+        # Service state/output/extra dirs
+        lib.concatLists (lib.mapAttrsToList (_: svc:
+          lib.optional (svc.stateDir != null && svc.user != null)
+          "d ${svc.stateDir} 0750 ${svc.user} ${svc.group} -"
+          ++ lib.optional (svc.outputDir != null && svc.user != null)
+          "d ${svc.outputDir} 0750 ${svc.user} ${svc.group} -"
+          ++ lib.mapAttrsToList (_: dir: let
+            u =
+              if dir.user != null
+              then dir.user
+              else if svc.user != null
+              then svc.user
+              else "root";
+            g =
+              if dir.group != null
+              then dir.group
+              else if svc.group != null
+              then svc.group
+              else "root";
+          in "d ${dir.path} ${dir.mode} ${u} ${g} -")
+          svc.extraDirs)
+        enabled)
+        # Workspace setgid directories
+        ++ (lib.mapAttrsToList (
+            _: ws: "d ${ws.path} 2775 ${ws.owner} ${ws.group} -"
+          )
+          wsCfg);
 
       # ── Firewall ──────────────────────────────────────────────────
       networking.firewall.allowedTCPPorts =
@@ -876,6 +949,20 @@ in {
             message = "managedServices: duplicate domain detected — each service must have a unique domain";
           }
         ]
+        # Workspace access validation: each access entry must exist in workspaces.*
+        ++ lib.concatLists (lib.mapAttrsToList (
+            name: svc:
+              map (wsName: {
+                assertion = wsCfg ? ${wsName};
+                message = "managedServices.${name}: access refers to workspace '${wsName}' which is not declared in workspaces.*";
+              })
+              svc.access
+              ++ lib.optional (svc.access != [] && svc.user == null) {
+                assertion = false;
+                message = "managedServices.${name}: access requires user to be set (need a user to add to workspace groups)";
+              }
+          )
+          enabled)
         ++ lib.concatLists (lib.mapAttrsToList (
             name: svc:
             # Deployment: ExecStart needs a binary
