@@ -61,6 +61,20 @@ in {
         default = {};
         description = "Additional Mosquitto settings merged into the listener config.";
       };
+
+      hookListener = {
+        enable = lib.mkEnableOption "Anonymous MQTT hook listener for workspace commit notifications";
+
+        port = lib.mkOption {
+          type = lib.types.port;
+          default = 1884;
+          description = ''
+            Port for the anonymous hook listener. Services with commit-level
+            workspace access use this to signal push triggers via mosquitto_pub.
+            Topic-scoped ACL: only write to workspace/+/commit is permitted.
+          '';
+        };
+      };
     };
 
     users = lib.mkOption {
@@ -87,6 +101,13 @@ in {
       default = brokerCfg.port;
       description = "MQTT broker port (for service modules to reference). Auto-derived from broker.port when using local broker.";
     };
+
+    hookPort = lib.mkOption {
+      type = lib.types.port;
+      default = brokerCfg.hookListener.port;
+      readOnly = true;
+      description = "Port of the anonymous hook listener (for post-commit hooks to reference).";
+    };
   };
 
   config = lib.mkIf brokerCfg.enable {
@@ -95,20 +116,32 @@ in {
       settings =
         {max_queued_messages = brokerCfg.maxQueuedMessages;}
         // brokerCfg.extraSettings;
-      listeners = [
-        {
-          inherit (brokerCfg) address port;
-          users =
-            lib.mapAttrs (
-              _name: userCfg:
-                {inherit (userCfg) acl;}
-                // lib.optionalAttrs (userCfg.passwordFile != null) {
-                  inherit (userCfg) passwordFile;
-                }
-            )
-            cfg.users;
-        }
-      ];
+      listeners =
+        [
+          {
+            inherit (brokerCfg) address port;
+            users =
+              lib.mapAttrs (
+                _name: userCfg:
+                  {inherit (userCfg) acl;}
+                  // lib.optionalAttrs (userCfg.passwordFile != null) {
+                    inherit (userCfg) passwordFile;
+                  }
+              )
+              cfg.users;
+          }
+        ]
+        # Hook listener: anonymous, topic-scoped write-only ACL for commit notifications.
+        # Services with commit-level workspace access publish here to trigger git push.
+        # Security: topic ACL restricts to workspace/+/commit write only. Worst case
+        # is spurious no-op pushes (idempotent). No subscribe permitted.
+        ++ lib.optional brokerCfg.hookListener.enable {
+          address = "127.0.0.1";
+          port = brokerCfg.hookListener.port;
+          omitPasswordAuth = true;
+          settings.allow_anonymous = true;
+          acl = ["topic write workspace/+/commit"];
+        };
     };
   };
 }

@@ -28,6 +28,7 @@
 {
   config,
   lib,
+  pkgs,
   options,
   ...
 }: let
@@ -751,13 +752,28 @@
       };
 
       # ── Workspace access ───────────────────────────────────────────
+      workspaces = lib.mkOption {
+        type = lib.types.attrsOf (lib.types.enum ["read" "write" "commit"]);
+        default = {};
+        description = ''
+          Typed workspace access grants for this service. Each key must match
+          a workspaces.<name> declaration. Access levels:
+            read   — group membership + safe.directory (filesystem already readable under ProtectSystem=strict)
+            write  — group membership + safe.directory + ReadWritePaths
+            commit — write + ReadWritePaths for commitExtraPaths + mosquitto_pub in PATH
+          The "commit" level is a composed capability (Capsicum precedent):
+          commit = write + trigger authority (MQTT publish to workspace topic).
+        '';
+      };
+
+      # Deprecated: use workspaces.<name> = "write" instead.
+      # Kept for backward compatibility during migration.
       access = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [];
         description = ''
+          DEPRECATED — use workspaces instead. Maps to workspaces.<name> = "write".
           List of workspace names this service participates in.
-          The service's user is added to each workspace's group.
-          Each name must correspond to a workspaces.<name> declaration.
         '';
       };
     };
@@ -804,12 +820,22 @@ in {
           default = [];
           description = "Non-managed-service users that need workspace group access.";
         };
+        commitExtraPaths = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [];
+          description = ''
+            Extra ReadWritePaths granted to services with commit-level access.
+            Set by nix-src-sync for the MQTT hook socket, or by any module
+            needing commit-level writes beyond the workspace path itself.
+          '';
+        };
       };
     }));
     default = {};
     description = ''
       Shared workspace declarations. Each workspace creates a group with setgid
-      directory. Managed services join workspaces via access = ["name"].
+      directory. Managed services declare typed access via
+      managedServices.<name>.workspaces.<ws> = "read"|"write"|"commit".
     '';
   };
 
@@ -853,6 +879,47 @@ in {
       lib.filter (d: d != null)
       (lib.mapAttrsToList (_: svc: svc.domain) enabled);
     uniqueDomains = lib.unique allDomains;
+
+    # ── Workspace capability helpers ─────────────────────────────
+    # Merge deprecated access (list of workspace names → "write") with new
+    # typed workspaces attrset. The new workspaces option takes precedence.
+    mergedWorkspaces = svc:
+      (lib.genAttrs svc.access (_: "write")) // svc.workspaces;
+
+    # Resolve workspace groups from access grants, dereferencing through
+    # config.workspaces.${wsName}.group (NOT using wsName directly as group,
+    # since workspaces.foo.group can differ from "foo").
+    wsGroups = svc:
+      lib.unique (lib.mapAttrsToList (wsName: _: wsCfg.${wsName}.group) (mergedWorkspaces svc));
+
+    # Workspace paths by access level for a service
+    wsReadPaths = svc:
+      lib.mapAttrsToList (wsName: _: wsCfg.${wsName}.path)
+      (lib.filterAttrs (_: level: level == "read") (mergedWorkspaces svc));
+
+    wsWritePaths = svc:
+      lib.mapAttrsToList (wsName: _: wsCfg.${wsName}.path)
+      (lib.filterAttrs (_: level: level == "write" || level == "commit") (mergedWorkspaces svc));
+
+    wsCommitExtraPaths = svc:
+      lib.concatLists (lib.mapAttrsToList (wsName: _: wsCfg.${wsName}.commitExtraPaths)
+      (lib.filterAttrs (_: level: level == "commit") (mergedWorkspaces svc)));
+
+    # All workspace paths accessed by any service (for safe.directory)
+    allWsPaths = svc:
+      lib.mapAttrsToList (wsName: _: wsCfg.${wsName}.path) (mergedWorkspaces svc);
+
+    # Services with any commit-level workspace access
+    hasCommitAccess = svc:
+      lib.any (level: level == "commit") (lib.attrValues (mergedWorkspaces svc));
+
+    # All workspace paths across all services (for safe.directory)
+    allSafeDirectories = lib.unique (lib.concatLists
+      (lib.mapAttrsToList (_: svc: allWsPaths svc) enabled));
+
+    # All unique workspace paths for duplicate detection
+    allWsPathsList = lib.mapAttrsToList (_: ws: ws.path) wsCfg;
+    uniqueWsPaths = lib.unique allWsPathsList;
   in
     {
       # ── Proxy registration ────────────────────────────────────────
@@ -873,15 +940,18 @@ in {
 
       # ── Users and groups ──────────────────────────────────────────
       users.users = lib.mkMerge (
-        # Service users
-        (lib.mapAttrsToList (_: svc:
+        # Service users — extraGroups resolved through workspace group names,
+        # NOT workspace keys directly (workspaces.foo.group can differ from "foo").
+        (lib.mapAttrsToList (_: svc: let
+          groups = wsGroups svc;
+        in
           lib.mkIf (svc.user != null) {
             ${svc.user} = {
               isSystemUser = true;
               group = svc.group;
               home = lib.mkIf (svc.stateDir != null) svc.stateDir;
               createHome = lib.mkIf (svc.stateDir != null) true;
-              extraGroups = lib.mkIf (svc.access != []) svc.access;
+              extraGroups = lib.mkIf (groups != []) groups;
             };
           })
         enabled)
@@ -945,6 +1015,16 @@ in {
       networking.firewall.allowedUDPPorts =
         lib.concatLists (lib.mapAttrsToList (_: svc: svc.openUDPPorts) enabled);
 
+      # ── Workspace safe.directory ─────────────────────────────────
+      # Per-path entries only. NEVER wildcard ("*") — wildcard re-enables
+      # CVE-2022-24765 (poisoned .git/config privilege escalation).
+      # NOTE: programs.git.config.safe.directory uses NixOS's `anything` type
+      # which cannot merge multiple definitions. The host config sets safe.directory
+      # in Phase 3 (workspace-refactor) using allSafeDirectories computed here.
+      # The helper is available for host configs to reference:
+      #   programs.git.config.safe.directory = allSafeDirectories;
+      # (where allSafeDirectories is exposed via the let-binding above)
+
       # ── Assertions ───────────────────────────────────────────────
       assertions =
         # Domain collision detection
@@ -954,17 +1034,62 @@ in {
             message = "managedServices: duplicate domain detected — each service must have a unique domain";
           }
         ]
-        # Workspace access validation: each access entry must exist in workspaces.*
+        # Workspace access validation
         ++ lib.concatLists (lib.mapAttrsToList (
-            name: svc:
-              map (wsName: {
+            name: svc: let
+              merged = mergedWorkspaces svc;
+            in
+              # Each workspace reference must exist in workspaces.*
+              lib.mapAttrsToList (wsName: _: {
                 assertion = wsCfg ? ${wsName};
-                message = "managedServices.${name}: access refers to workspace '${wsName}' which is not declared in workspaces.*";
-              })
-              svc.access
-              ++ lib.optional (svc.access != [] && svc.user == null) {
+                message = "managedServices.${name}: workspaces.${wsName} refers to workspace '${wsName}' which is not declared in workspaces.*";
+              }) merged
+              # Workspace access requires user (needed for group membership)
+              ++ lib.optional (merged != {} && svc.user == null) {
                 assertion = false;
-                message = "managedServices.${name}: access requires user to be set (need a user to add to workspace groups)";
+                message = "managedServices.${name}: workspaces access requires user to be set (need a user to add to workspace groups)";
+              }
+          )
+          enabled)
+        # Duplicate workspace paths
+        ++ [{
+          assertion = builtins.length allWsPathsList == builtins.length uniqueWsPaths;
+          message = "workspaces: duplicate path detected — each workspace must have a unique path";
+        }]
+        # outputCommit targeting a workspace without commit access (post-commit hook
+        # needs MQTT socket access, which is only granted at commit level).
+        # Uses most-specific match: if outputDir is inside both workspace A (/var/lib/src)
+        # and workspace B (/var/lib/src/hq-data), only B's access level matters.
+        ++ lib.concatLists (lib.mapAttrsToList (
+            name: svc: let
+              merged = mergedWorkspaces svc;
+              outputRepo =
+                if svc.outputDir != null
+                then svc.outputDir
+                else null;
+              # Find all workspaces whose path is a prefix of outputDir
+              matchingWs = lib.filterAttrs (wsName: _:
+                outputRepo != null
+                && lib.hasPrefix wsCfg.${wsName}.path outputRepo
+              ) merged;
+              # Most-specific match: workspace with the longest path prefix
+              mostSpecific =
+                if matchingWs == {}
+                then null
+                else
+                  lib.foldl' (best: wsName:
+                    if best == null || builtins.stringLength wsCfg.${wsName}.path > builtins.stringLength wsCfg.${best}.path
+                    then wsName
+                    else best
+                  ) null (lib.attrNames matchingWs);
+            in
+              lib.optional (
+                svc.outputCommit != null
+                && mostSpecific != null
+                && merged.${mostSpecific} != "commit"
+              ) {
+                assertion = false;
+                message = "managedServices.${name}: outputCommit targets workspace '${mostSpecific}' but only has '${merged.${mostSpecific}}' access — commit level required for post-commit hook MQTT trigger";
               }
           )
           enabled)
@@ -1088,6 +1213,23 @@ in {
             (lib.mkIf (hasSops && hasAnySec svc) {
               after = ["sops-nix.service"];
               wants = ["sops-nix.service"];
+            })
+            # Workspace ReadWritePaths — auto-computed from workspace access levels.
+            # write/commit → ReadWritePaths for workspace path.
+            # commit → also ReadWritePaths for commitExtraPaths (e.g. MQTT socket).
+            # This is what prevents the confused deputy problem: the capability grant
+            # in managedServices.*.workspaces determines the sandbox permissions.
+            (lib.mkIf (svc.hardening != "none" && mergedWorkspaces svc != {}) (let
+              writePaths = wsWritePaths svc;
+              commitExtra = wsCommitExtraPaths svc;
+              allPaths = writePaths ++ commitExtra;
+            in
+              lib.optionalAttrs (allPaths != []) {
+                serviceConfig.ReadWritePaths = allPaths;
+              }))
+            # mosquitto_pub in PATH for services with commit-level workspace access
+            (lib.mkIf (hasCommitAccess svc) {
+              path = [pkgs.mosquitto];
             })
             # User overrides (merged on top of defaults)
             (builtins.removeAttrs svc.service ["script"])
