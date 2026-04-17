@@ -341,8 +341,12 @@
         # Pre-deploy hook
         ${svc.deployment.preDeploy}
       ''}
+      # --refresh bypasses nix's flake-ref cache so `?ref=main` resolves to
+      # the current HEAD of the source repo. Without it, nix reuses the
+      # cached ref→rev mapping and rebuilds the same stale closure every
+      # time the deploy is triggered (see calc deploy stuck on old ac82269).
       result=$(/run/current-system/sw/bin/nix build ${lib.escapeShellArg svc.deployment.buildExpr} \
-        --no-link --print-out-paths | tail -1)
+        --refresh --no-link --print-out-paths | tail -1)
       ${lib.optionalString (svc.deployment.healthCheck != null) ''
         # Save previous slot for rollback
         _prev_slot=""
